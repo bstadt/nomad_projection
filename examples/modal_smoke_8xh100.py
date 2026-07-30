@@ -43,6 +43,7 @@ image = (
         "scipy==1.13.1",
         "matplotlib",
         "tqdm",
+        "pymetis",  # optional dep, but included so graph_partition='auto' exercises METIS
     )
     .add_local_python_source("nomad_projection")
 )

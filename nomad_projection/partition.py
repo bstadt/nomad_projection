@@ -173,8 +173,7 @@ def graph_partition_labels_metis(neighbors, n_cells, ufactor=3, seed=42):
     options.ufactor = ufactor
     options.seed = seed
     s = time.time()
-    _, parts = pymetis.part_graph(
-        n_cells, adjacency=pymetis.CSRAdjacency(xadj, adjncy), options=options)
+    _, parts = pymetis.part_graph(n_cells, xadj=xadj, adjncy=adjncy, options=options)
     labels = np.asarray(parts, dtype=np.int64)
 
     # An isolated node has no edges for METIS to reason about, so it can land anywhere
