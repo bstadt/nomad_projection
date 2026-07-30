@@ -46,8 +46,20 @@ This fork is validated on an 8xH100 [Modal](https://modal.com) container. To smo
 
 ```bash
 pip install modal
+modal setup   # first time only: authenticates your Modal account
 modal run examples/modal_smoke_8xh100.py
 ```
+
+No other local dependencies are needed — the container image defined in the example pins everything (`torch==2.9.0`, `scipy==1.13.1`, numpy/scikit-learn/matplotlib/tqdm) and mounts the local `nomad_projection` package, so the code you edit locally is the code that runs remotely.
+
+**Validated configuration** (2026-07-30, 2M x 64 synthetic blobs, 10 epochs, `batch_size=40000`, `n_noise=2000`, `gpu="H100:8"`):
+
+| n_cells | GPUs used | wall clock | result |
+|---------|-----------|------------|--------|
+| 16 | 8 (2 cells/GPU) | 224s | all coords finite, non-degenerate |
+| 5 (upstream README default) | 5 via fallback | 145s | all coords finite, non-degenerate |
+
+To project your own data instead of the synthetic blobs, replace the array construction at the top of `smoke()` with a load from a [Modal Volume](https://modal.com/docs/guide/volumes) (generate or upload your `.npy` there first; passing hundreds of MB through `.remote()` arguments works but is slow). For large real datasets, start from the parameter notes at the bottom of this section.
 
 Things this fork fixes/pins that upstream does not, all discovered the hard way:
 
