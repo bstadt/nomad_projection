@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import torch
 
@@ -108,6 +110,85 @@ def graph_partition_labels(neighbors, n_cells, n_iter=10, device=None, chunk=4_0
     out = np.empty(n, dtype=np.int64)
     out[perm] = np.arange(n, dtype=np.int64) * n_cells // n
     return out
+
+
+def _symmetric_csr_from_neighbors(neighbors):
+    """(xadj, adjncy) of the undirected simple graph behind a (n, k) neighbor table.
+
+    METIS requires a symmetric adjacency with no self-loops and no duplicate entries,
+    while a neighbor table is directed (i can list j without j listing i), -1 padded,
+    and may repeat a node.
+    """
+    neighbors = np.asarray(neighbors)
+    n = neighbors.shape[0]
+    valid = neighbors >= 0
+    rows = np.repeat(np.arange(n, dtype=np.int64), valid.sum(axis=1))
+    cols = neighbors[valid].astype(np.int64)
+
+    keep = rows != cols
+    rows, cols = rows[keep], cols[keep]
+    r = np.concatenate([rows, cols])
+    c = np.concatenate([cols, rows])
+
+    order = np.lexsort((c, r))
+    r, c = r[order], c[order]
+    if len(r):
+        uniq = np.empty(len(r), dtype=bool)
+        uniq[0] = True
+        np.not_equal(r[1:], r[:-1], out=uniq[1:])
+        uniq[1:] |= c[1:] != c[:-1]
+        r, c = r[uniq], c[uniq]
+
+    xadj = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(np.bincount(r, minlength=n), out=xadj[1:])
+    return xadj, c
+
+
+def graph_partition_labels_metis(neighbors, n_cells, ufactor=3, seed=42):
+    """Balanced minimum k-way cut of the neighbor table (requires pymetis).
+
+    GraphKNN keeps only the neighbors that land in the same cell, so the partition
+    decides how much of the graph the optimizer can see at all — a node left with no
+    same-cell neighbor gets a self-loop, which is a no-op force. Minimizing the cut
+    directly is therefore worth far more here than it looks.
+
+    Measured on a 630k-node / 5.7M-edge TikTok repost graph at n_cells=8, against the
+    label-propagation-then-chop partitioner:
+
+        partition          edges kept   nodes with no same-cell neighbor
+        label-prop + chop      0.293                             34.8%
+        metis                  0.647                              0.1%
+
+    which moved the median distance between reciprocal pairs in the finished layout
+    from 0.625 to 0.021 (normalized by the median random-pair distance).
+
+    ufactor is METIS's allowed imbalance in units of 0.1%; the default 3 keeps cells
+    within ~0.3% of even, since cells are sharded round-robin across GPUs.
+    """
+    import pymetis
+
+    n = np.asarray(neighbors).shape[0]
+    xadj, adjncy = _symmetric_csr_from_neighbors(neighbors)
+    options = pymetis.Options()
+    options.ufactor = ufactor
+    options.seed = seed
+    s = time.time()
+    _, parts = pymetis.part_graph(
+        n_cells, adjacency=pymetis.CSRAdjacency(xadj, adjncy), options=options)
+    labels = np.asarray(parts, dtype=np.int64)
+
+    # An isolated node has no edges for METIS to reason about, so it can land anywhere
+    # and skew the balance the GPU sharding assumes. Spread them over the cells that
+    # came back smallest.
+    isolated = np.flatnonzero(np.diff(xadj) == 0)
+    if len(isolated):
+        sizes = np.bincount(labels, minlength=n_cells)
+        labels[isolated] = np.argsort(sizes)[np.arange(len(isolated)) % n_cells]
+
+    sizes = np.bincount(labels, minlength=n_cells)
+    print(f'metis partition took: {time.time() - s:.1f}s '
+          f'({n_cells} cells, sizes {sizes.min()}..{sizes.max()})')
+    return labels
 
 
 def topk_neighbors_from_csr(A, k):
