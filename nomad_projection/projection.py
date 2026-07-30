@@ -11,7 +11,8 @@ import torch.multiprocessing as mp
 from sklearn.decomposition import PCA
 from matplotlib.animation import PillowWriter
 from matplotlib.animation import FuncAnimation
-from nomad_projection.neighbors import PartitionANN
+from nomad_projection.neighbors import PartitionANN, GraphKNN
+from nomad_projection.partition import balanced_partition_labels, graph_partition_labels
 
 def get_gpu_memory_usage():
     import gc
@@ -217,9 +218,11 @@ class NomadProjection:
 
 
     def fit_transform(self,
-            X,
-            batch_size,
-            epochs,
+            X=None,
+            batch_size=None,
+            epochs=None,
+            neighbors=None,
+            partition='balanced',
             n_cells=5,
             cluster_chunk_size=2000,
             n_neighbors=8,
@@ -233,12 +236,39 @@ class NomadProjection:
             cluster_subset_size=5000000,
             debug_plot=False,
            ):
+        """Project to 2D.
+
+        Two input modes:
+        - Feature mode: pass X (n, d). Cells come from `partition`
+          ('balanced' = exactly even recursive-bisection cells, 'lsh' =
+          upstream LSH k-means), and kNN is computed per cell.
+        - Graph mode: pass neighbors (n, k) of global neighbor ids per node
+          (-1 = missing; e.g. from partition.topk_neighbors_from_csr). The
+          kNN search is skipped entirely — neighbor tables are read off the
+          graph. Cells come from X (balanced partition) when X is also
+          given, otherwise from a locality-preserving ordering of the graph
+          itself. X, when present alongside neighbors, is used only for
+          partitioning and PCA init.
+        """
+        if X is None and neighbors is None:
+            raise ValueError('pass X (feature mode) and/or neighbors (graph mode)')
+        if batch_size is None or epochs is None:
+            raise ValueError('batch_size and epochs are required')
 
         #Setup Params
-        n = X.shape[0]
-        d = X.shape[1]
+        n = X.shape[0] if X is not None else neighbors.shape[0]
 
-        self._knn_obj = PartitionANN(X, n_neighbors+1, n_cells, cluster_subset_size, cluster_chunk_size)
+        if neighbors is not None:
+            neighbors = np.asarray(neighbors)
+            if X is not None and X.shape[0] != neighbors.shape[0]:
+                raise ValueError('X and neighbors disagree on n')
+            if X is not None:
+                labels = balanced_partition_labels(X, n_cells)
+            else:
+                labels = graph_partition_labels(neighbors, n_cells)
+            self._knn_obj = GraphKNN(neighbors, labels, n_neighbors)
+        else:
+            self._knn_obj = PartitionANN(X, n_neighbors+1, n_cells, cluster_subset_size, cluster_chunk_size, method=partition)
         self._knn = self._knn_obj._clusterwise_topk
         self._clusterwise_X_ids = self._knn_obj.clusterwise_X_ids
         self.cluster_assignments = self._knn_obj.labels
@@ -246,15 +276,20 @@ class NomadProjection:
         # which would be needlessly IPC-shared with every worker process.
         self._knn_obj = None
         torch.cuda.empty_cache()
-            
+
         init_lr = n * lr_scale
 
-        # Convert input data to a PyTorch tensor
-        X_tensor = torch.tensor(X, dtype=torch.float32)
+        if X is not None:
+            # Convert input data to a PyTorch tensor
+            X_tensor = torch.tensor(X, dtype=torch.float32)
 
-        # Perform PCA using PyTorch
-        U, S, V = torch.pca_lowrank(X_tensor, q=2)
-        init = U[:, :2].numpy()  # Get the first two principal components
+            # Perform PCA using PyTorch
+            U, S, V = torch.pca_lowrank(X_tensor, q=2)
+            init = U[:, :2].numpy()  # Get the first two principal components
+            del X_tensor
+        else:
+            # No features to seed from — random init at the usual scale
+            init = np.random.randn(n, 2).astype(np.float32)
         init /= (init[:, 0].std()) / 1e-4
 
         num_clusters = len(self._knn)

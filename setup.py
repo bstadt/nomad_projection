@@ -20,6 +20,7 @@ setup(
         'torch',
         'click',
         'numpy',
+        'scipy',
         'pandas',
         'scikit-learn',
         'matplotlib',

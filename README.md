@@ -40,6 +40,30 @@ lowd = p.fit_transform(X=x,
                        )
 ```
 
+## Projecting graphs directly
+
+When your data *is* a large graph, the kNN is already sitting in the adjacency structure — there is no reason to run the (expensive, OOM-prone) per-cell similarity search. Pass a `(n, k)` neighbor table instead of a feature matrix and the search is skipped entirely:
+
+```python
+from nomad_projection import NomadProjection
+from nomad_projection.partition import topk_neighbors_from_csr
+
+neighbors = topk_neighbors_from_csr(adjacency_csr, k=16)  # (n, k) ids, -1 padded
+# ...or build (n, k) yourself: each row = a node's neighbor ids by descending weight
+
+p = NomadProjection()
+lowd = p.fit_transform(neighbors=neighbors, epochs=100, batch_size=40000,
+                       n_cells=16, n_neighbors=8, n_noise=2000)
+```
+
+- With only `neighbors`, cells come from the graph itself: label propagation finds communities (vectorized row-wise `torch.mode`, chunked), then nodes are grouped by community and chopped into exactly even cells. Init is random.
+- Pass `X` *alongside* `neighbors` and the features are used for the balanced partition and PCA init, while the kNN still comes straight off the graph — the recommended setup when you have both (e.g. SVD vectors + the interaction graph they came from).
+- Per-node neighbor lists shorter than `n_neighbors` are repeated cyclically; isolated nodes get a self-loop (a no-op positive force).
+
+## Balanced partitioning
+
+Centroid-based clustering (upstream's LSH k-means) can put nearly all points into one cell on heavy-tailed data — one mass cell OOMs the per-cell kNN and shards terribly across GPUs. This fork's default partition (`partition='balanced'`) is recursive bisection along principal directions with the cut at the *rank* quantile, so cell sizes are exact (within ±1 point per split) by construction, on any data distribution. Every GPU gets an identically-sized shard. The upstream behavior remains available with `partition='lsh'`.
+
 ## Running on Modal (8xH100)
 
 This fork is validated on an 8xH100 [Modal](https://modal.com) container. To smoke-test it end to end, run this from the repository root:
@@ -52,12 +76,14 @@ modal run examples/modal_smoke_8xh100.py
 
 No other local dependencies are needed — the container image defined in the example pins everything (`torch==2.9.0`, `scipy==1.13.1`, numpy/scikit-learn/matplotlib/tqdm) and mounts the local `nomad_projection` package, so the code you edit locally is the code that runs remotely.
 
-**Validated configuration** (2026-07-30, 2M x 64 synthetic blobs, 10 epochs, `batch_size=40000`, `n_noise=2000`, `gpu="H100:8"`):
+**Validated configuration** (2026-07-30, 2M points, 10 epochs, `batch_size=40000`, `n_noise=2000`, `gpu="H100:8"`):
 
-| n_cells | GPUs used | wall clock | result |
-|---------|-----------|------------|--------|
-| 16 | 8 (2 cells/GPU) | 224s | all coords finite, non-degenerate |
-| 5 (upstream README default) | 5 via fallback | 145s | all coords finite, non-degenerate |
+| scenario | n_cells | GPUs used | wall clock | result |
+|----------|---------|-----------|------------|--------|
+| features (64d blobs) | 16 | 8 (2 cells/GPU) | 224s | all coords finite, non-degenerate |
+| features | 5 (upstream README default) | 5 via fallback | 145s | all coords finite, non-degenerate |
+| features, 75% of mass in one blob | 16 | 8 | see smoke | cells exactly even (LSH k-means collapses here) |
+| graph mode (community graph, no X) | 16 | 8 | see smoke | kNN search skipped; cells exactly even |
 
 To project your own data instead of the synthetic blobs, replace the array construction at the top of `smoke()` with a load from a [Modal Volume](https://modal.com/docs/guide/volumes) (generate or upload your `.npy` there first; passing hundreds of MB through `.remote()` arguments works but is slow). For large real datasets, start from the parameter notes at the bottom of this section.
 

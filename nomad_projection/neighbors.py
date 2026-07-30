@@ -87,17 +87,23 @@ class LSHKMeans:
         return labels
 
 class PartitionANN:
-    def __init__(self, X, n_neighbors, n_cells, cluster_subset_size, cluster_chunk_size=None):
+    def __init__(self, X, n_neighbors, n_cells, cluster_subset_size, cluster_chunk_size=None, method='balanced'):
         if cluster_chunk_size is None:
             cluster_chunk_size = n_cells
         total_s = time.time()
-        
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print('device: ', self.device)
 
         # cluster
         s = time.time()
-        if X.shape[0] < 5000000:
+        if method == 'balanced':
+            print('Balanced partition (recursive principal-direction bisection)')
+            from nomad_projection.partition import balanced_partition_labels
+            cluster_ids = balanced_partition_labels(X, n_cells, device=self.device)
+            self.n_cells = n_cells
+            self.labels = cluster_ids
+        elif X.shape[0] < 5000000:
             print('Clustering on All Data')
             X = torch.from_numpy(X)
             print('clustering')
@@ -167,3 +173,56 @@ class PartitionANN:
 
     def knn(self, target, k):
         return self._topk[target, :k]
+
+
+class GraphKNN:
+    """Per-cell kNN tables read directly off a (n, k) neighbor table.
+
+    Replaces PartitionANN's dense per-cell similarity search when the data is
+    a graph whose neighbor lists are already known (e.g. an adjacency matrix).
+    Each node keeps its neighbors that landed in the same cell, cyclically
+    repeated up to n_neighbors; a node with no same-cell neighbors gets itself
+    (a self-positive is a no-op force). Output format matches PartitionANN:
+    _clusterwise_topk[c] is (m, n_neighbors+1) of cell-local indices with
+    column 0 = self.
+    """
+
+    def __init__(self, neighbors, labels, n_neighbors):
+        s = time.time()
+        neighbors = np.asarray(neighbors)
+        labels = np.asarray(labels, dtype=np.int64)
+        n, k_in = neighbors.shape
+        if n_neighbors > k_in:
+            print(f'GraphKNN: n_neighbors={n_neighbors} > neighbor table width '
+                  f'{k_in}; entries will repeat cyclically')
+        k = n_neighbors
+        n_cells = int(labels.max()) + 1
+        self.labels = labels
+
+        local_idx = np.empty(n, dtype=np.int64)
+        self.clusterwise_X_ids = []
+        for c in range(n_cells):
+            ids = np.flatnonzero(labels == c)
+            self.clusterwise_X_ids.append(ids)
+            local_idx[ids] = np.arange(len(ids), dtype=np.int64)
+
+        self._clusterwise_topk = {}
+        for c, ids in enumerate(tqdm(self.clusterwise_X_ids)):
+            nb = neighbors[ids]  # (m, k_in) global ids, -1 padded
+            valid = nb >= 0
+            same = np.zeros_like(valid)
+            same[valid] = labels[nb[valid]] == c
+            # stable-sort same-cell neighbors to the front of each row
+            order = np.argsort(~same, axis=1, kind='stable')
+            nb_sorted = np.take_along_axis(nb, order, axis=1)
+            counts = same.sum(axis=1)
+            cols = np.arange(k, dtype=np.int64)[None, :]
+            src = np.where(counts[:, None] > 0,
+                           cols % np.maximum(counts[:, None], 1), 0)
+            gathered = np.take_along_axis(nb_sorted, src, axis=1)
+            gathered = np.where(counts[:, None] > 0, gathered, ids[:, None])
+            out = np.empty((len(ids), k + 1), dtype=np.int64)
+            out[:, 0] = np.arange(len(ids), dtype=np.int64)
+            out[:, 1:] = local_idx[gathered]
+            self._clusterwise_topk[c] = out
+        print('graph knn extraction took: ', time.time() - s)
