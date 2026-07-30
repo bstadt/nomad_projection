@@ -154,7 +154,10 @@ def main(
     epochs: int = 10,
     batch_size: int = 40000,
     n_noise: int = 2000,
+    only: str = "",
 ):
+    """Run all scenarios, or a comma-separated subset via --only."""
+    wanted = set(only.split(",")) if only else None
     results = {}
 
     for name, n_cells, skewed in (
@@ -162,6 +165,8 @@ def main(
         ("features_5cells_fallback", 5, False),
         ("features_skewed", 16, True),
     ):
+        if wanted is not None and name not in wanted:
+            continue
         r = smoke_features.remote(n_points, dim, n_cells, epochs, batch_size, n_noise, skewed)
         print(f"{name}: {r}")
         assert r["finite_frac"] == 1.0, name
@@ -170,13 +175,14 @@ def main(
         assert hi - lo <= n_cells, f"{name}: unbalanced cells {lo}..{hi}"
         results[name] = r
 
-    r = smoke_graph.remote(n_points, 16, 16, epochs, batch_size, n_noise)
-    print(f"graph_mode: {r}")
-    assert r["finite_frac"] == 1.0
-    assert min(r["coord_std"]) > 0
-    assert r["world_size"] == 8
-    lo, hi = r["cell_sizes_min_max"]
-    assert hi - lo <= 16, f"graph: unbalanced cells {lo}..{hi}"
-    results["graph_mode"] = r
+    if wanted is None or "graph_mode" in wanted:
+        r = smoke_graph.remote(n_points, 16, 16, epochs, batch_size, n_noise)
+        print(f"graph_mode: {r}")
+        assert r["finite_frac"] == 1.0
+        assert min(r["coord_std"]) > 0
+        assert r["world_size"] == 8
+        lo, hi = r["cell_sizes_min_max"]
+        assert hi - lo <= 16, f"graph: unbalanced cells {lo}..{hi}"
+        results["graph_mode"] = r
 
     print("SMOKE PASSED")

@@ -80,10 +80,12 @@ No other local dependencies are needed — the container image defined in the ex
 
 | scenario | n_cells | GPUs used | wall clock | result |
 |----------|---------|-----------|------------|--------|
-| features (64d blobs) | 16 | 8 (2 cells/GPU) | 224s | all coords finite, non-degenerate |
-| features | 5 (upstream README default) | 5 via fallback | 145s | all coords finite, non-degenerate |
-| features, 75% of mass in one blob | 16 | 8 | see smoke | cells exactly even (LSH k-means collapses here) |
-| graph mode (community graph, no X) | 16 | 8 | see smoke | kNN search skipped; cells exactly even |
+| features (64d blobs) | 16 | 8 (2 cells/GPU) | 156s | cells exactly 125,000 each; all coords finite |
+| features | 5 (upstream README default) | 5 via fallback | 132s | cells exactly 400,000 each; all coords finite |
+| features, 75% of mass in one blob | 16 | 8 | 164s | cells still exactly 125,000 each (LSH k-means collapses here) |
+| graph mode (community graph, no X) | 16 | 8 | 235s | kNN search skipped; cells exactly even; 92% of edges intra-cell |
+
+Run a subset of scenarios with e.g. `modal run examples/modal_smoke_8xh100.py --only graph_mode`. For long runs prefer `modal run --detach` — an ephemeral app is otherwise stopped server-side if the client connection blips.
 
 To project your own data instead of the synthetic blobs, replace the array construction at the top of `smoke()` with a load from a [Modal Volume](https://modal.com/docs/guide/volumes) (generate or upload your `.npy` there first; passing hundreds of MB through `.remote()` arguments works but is slow). For large real datasets, start from the parameter notes at the bottom of this section.
 
