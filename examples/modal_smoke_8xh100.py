@@ -33,7 +33,7 @@ image = (
 
 
 @app.function(gpu="H100:8", image=image, timeout=60 * 60, memory=65536)
-def smoke(n_points: int, dim: int, n_cells: int, epochs: int, batch_size: int) -> dict:
+def smoke(n_points: int, dim: int, n_cells: int, epochs: int, batch_size: int, n_noise: int) -> dict:
     import time
 
     import numpy as np
@@ -51,7 +51,9 @@ def smoke(n_points: int, dim: int, n_cells: int, epochs: int, batch_size: int) -
 
     start = time.time()
     p = NomadProjection()
-    coords = p.fit_transform(X=X, epochs=epochs, batch_size=batch_size, n_cells=n_cells)
+    coords = p.fit_transform(
+        X=X, epochs=epochs, batch_size=batch_size, n_cells=n_cells, n_noise=n_noise
+    )
     elapsed = time.time() - start
 
     assert coords.shape == (n_points, 2), coords.shape
@@ -75,12 +77,23 @@ def smoke(n_points: int, dim: int, n_cells: int, epochs: int, batch_size: int) -
 
 
 @app.local_entrypoint()
-def main(n_points: int = 2_000_000, dim: int = 64, epochs: int = 10, batch_size: int = 80000):
+def main(
+    n_points: int = 2_000_000,
+    dim: int = 64,
+    epochs: int = 10,
+    batch_size: int = 40000,
+    n_noise: int = 2000,
+):
+    # Per-step GPU memory scales with batch_size * n_noise (several tensors of
+    # that shape live simultaneously, plus their autograd graph). The upstream
+    # README defaults (80000 x 10000) exceed 80GiB and OOM an H100; 40000 x
+    # 2000 peaks well under 10GiB.
+    #
     # n_cells=16: even split across 8 GPUs (2 cells each).
     # n_cells=5 (the README default): fewer cells than GPUs, exercises the
     # world_size fallback that used to crash upstream.
     for n_cells in (16, 5):
-        result = smoke.remote(n_points, dim, n_cells, epochs, batch_size)
+        result = smoke.remote(n_points, dim, n_cells, epochs, batch_size, n_noise)
         print(f"n_cells={n_cells}: {result}")
         assert result["finite_frac"] == 1.0, "non-finite coordinates"
         assert min(result["coord_std"]) > 0, "degenerate embedding"

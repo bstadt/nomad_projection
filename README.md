@@ -56,6 +56,8 @@ Things this fork fixes/pins that upstream does not, all discovered the hard way:
 - Missing `nullcontext` import that crashed the CPU / pre-Ampere autocast path.
 - The GPU-side clusterer is released before workers are spawned, so its CUDA tensors are not needlessly IPC-shared with (and re-materialized in) every worker.
 
+- **Per-step GPU memory scales with `batch_size * n_noise`.** Each training step materializes several `(batch_size, n_noise)`-shaped tensors (the int64 noise-index tensor alone is `batch_size * n_noise * 8` bytes) plus their autograd graph. The usage-example values above (`batch_size=80000, n_noise=10000`) need more than 80GiB and OOM an H100 after the first step; `batch_size=40000, n_noise=2000` peaks well under 10GiB per GPU.
+
 Practical parameter notes from projecting a 28.8M x 128 dataset on 8xH100 (~large-run defaults): `lr_scale=0.015`, `late_exaggeration_scale=1.0`, `n_neighbors=64`, `n_cells=16`. Beware very skewed cluster size distributions: a single dominant cell OOMs the per-cell kNN, and many small cells (64+) make it drastically slower.
 
 ## Paper Replication
