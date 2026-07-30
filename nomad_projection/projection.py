@@ -4,6 +4,7 @@ import time
 import torch
 import numpy as np
 from datetime import timedelta
+from contextlib import nullcontext
 import matplotlib.pyplot as plt
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -241,6 +242,9 @@ class NomadProjection:
         self._knn = self._knn_obj._clusterwise_topk
         self._clusterwise_X_ids = self._knn_obj.clusterwise_X_ids
         self.cluster_assignments = self._knn_obj.labels
+        # Drop the clusterer before mp.spawn pickles self: it can hold CUDA tensors,
+        # which would be needlessly IPC-shared with every worker process.
+        self._knn_obj = None
         torch.cuda.empty_cache()
             
         init_lr = n * lr_scale
@@ -255,7 +259,18 @@ class NomadProjection:
 
         num_clusters = len(self._knn)
         cluster_ids = np.arange(num_clusters)
-        
+
+        # A rank with zero clusters crashes in _step (torch.cat of an empty list),
+        # so never use more GPUs than cells.
+        if self.world_size > num_clusters:
+            print(f'n_cells={num_clusters} < {self.world_size} visible GPUs; '
+                  f'training on {num_clusters} GPUs')
+            self.world_size = num_clusters
+        if self.world_size > 1 and num_clusters % self.world_size != 0:
+            print(f'WARNING: n_cells={num_clusters} is not divisible by world_size='
+                  f'{self.world_size}; ranks will hold uneven cluster counts. '
+                  f'Prefer n_cells as a multiple of the GPU count.')
+
         # Initialize the embedding models on each GPU
         self._model = torch.nn.ParameterList()
         for cluster_id in cluster_ids:

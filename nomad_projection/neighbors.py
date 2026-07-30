@@ -3,8 +3,6 @@ import time
 import torch
 import numpy as np
 from tqdm import tqdm
-from scipy.spatial import Voronoi
-from collections import defaultdict
 
 class LSHKMeans:
     def __init__(self, n_clusters, max_iter=1000, tol=1e-4, lsh_bits=16, chunk_size=2000):

@@ -40,6 +40,24 @@ lowd = p.fit_transform(X=x,
                        )
 ```
 
+## Running on Modal (8xH100)
+
+This fork is validated on an 8xH100 [Modal](https://modal.com) container. To smoke-test it end to end, run this from the repository root:
+
+```bash
+pip install modal
+modal run examples/modal_smoke_8xh100.py
+```
+
+Things this fork fixes/pins that upstream does not, all discovered the hard way:
+
+- **`torch==2.9.0` is required for multi-GPU on Modal.** NOMAD's distributed training shares CUDA tensors between the parent process and its `mp.spawn` workers via CUDA IPC. Modal's gVisor sandbox blocks the `pidfd_getfd` syscall that other torch versions use for this (2.7.1 and 2.12 both fail in testing), which breaks worker startup; 2.9.0 carries a working fallback. Single-GPU runs work on any torch version.
+- **`n_cells` must be at least the GPU count** (cells are assigned to GPUs round-robin). Upstream crashes with `torch.cat` on an empty list when a rank gets zero cells — e.g. the README-default `n_cells=5` on 8 GPUs. This fork falls back to using `n_cells` GPUs instead. Prefer `n_cells` as a multiple of the GPU count so ranks hold even cluster counts.
+- Missing `nullcontext` import that crashed the CPU / pre-Ampere autocast path.
+- The GPU-side clusterer is released before workers are spawned, so its CUDA tensors are not needlessly IPC-shared with (and re-materialized in) every worker.
+
+Practical parameter notes from projecting a 28.8M x 128 dataset on 8xH100 (~large-run defaults): `lr_scale=0.015`, `late_exaggeration_scale=1.0`, `n_neighbors=64`, `n_cells=16`. Beware very skewed cluster size distributions: a single dominant cell OOMs the per-cell kNN, and many small cells (64+) make it drastically slower.
+
 ## Paper Replication
 
 ### Environment Setup
