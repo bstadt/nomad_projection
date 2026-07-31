@@ -247,9 +247,9 @@ class NomadProjection:
             cluster_chunk_size=2000,
             n_neighbors=8,
             n_noise=10000,
-            late_exaggeration_time=1.1,
+            late_exaggeration_time=0.6,
             late_exaggeration_scale=1,
-            late_exaggeration_n_noise=10000,
+            late_exaggeration_n_noise=None,
             momentum=0.8,
             learning_rate_decay_start_time=0.3,
             lr_scale=0.1,
@@ -280,6 +280,17 @@ class NomadProjection:
         graph, metis kept 64.7% of edges against chop's 29.3%, and left 0.1%
         of nodes with no same-cell neighbor against 34.8%.
         """
+        # late_exaggeration_time is a FRACTION of training: t = epoch/epochs, so it only
+        # has an effect below 1.0. It shipped defaulting to 1.1, which meant the whole
+        # late phase — both the attraction boost and its noise count — was unreachable.
+        if late_exaggeration_time >= 1.0 and (late_exaggeration_scale != 1
+                                              or late_exaggeration_n_noise is not None):
+            print(f'WARNING: late_exaggeration_time={late_exaggeration_time} >= 1.0, but t '
+                  f'never exceeds 1.0 — the late phase will not run and '
+                  f'late_exaggeration_scale/n_noise are ignored. Pass a fraction (e.g. 0.6).')
+        if late_exaggeration_n_noise is None:
+            late_exaggeration_n_noise = n_noise
+
         if X is None and neighbors is None:
             raise ValueError('pass X (feature mode) and/or neighbors (graph mode)')
         if batch_size is None or epochs is None:
