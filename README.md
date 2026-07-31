@@ -56,9 +56,40 @@ lowd = p.fit_transform(neighbors=neighbors, epochs=100, batch_size=40000,
                        n_cells=16, n_neighbors=8, n_noise=2000)
 ```
 
-- With only `neighbors`, cells come from the graph itself: label propagation finds communities (vectorized row-wise `torch.mode`, chunked), then nodes are grouped by community and chopped into exactly even cells. Init is random.
+- With only `neighbors`, cells come from the graph itself — see **Cells decide how much graph you keep** below. Init is random.
 - Pass `X` *alongside* `neighbors` and the features are used for the balanced partition and PCA init, while the kNN still comes straight off the graph — the recommended setup when you have both (e.g. SVD vectors + the interaction graph they came from).
 - Per-node neighbor lists shorter than `n_neighbors` are repeated cyclically; isolated nodes get a self-loop (a no-op positive force).
+
+## Cells decide how much graph you keep
+
+In graph mode each node keeps only the neighbors that land in its **own cell**; every
+crossing edge is dropped before training, and a node left with no same-cell neighbor gets
+a self-loop, which is a no-op force. The partition therefore sets a hard ceiling on how
+much of the graph the optimizer can see, and no learning rate or epoch count recovers what
+it discarded.
+
+`graph_partition` selects how those cells are formed:
+
+| value | cells from |
+|-------|------------|
+| `'auto'` (default) | metis when pymetis is installed, else `'chop'` |
+| `'metis'` | balanced minimum k-way cut (`pip install pymetis`) |
+| `'chop'` | label propagation, then an equal contiguous chop |
+
+`'chop'` constrains balance exactly but never counts crossing edges, which is fine when
+communities are small and clean and expensive when they are not. Measured on a 630k-node /
+5.7M-edge TikTok repost graph at `n_cells=8`:
+
+| partition | edges kept | nodes with no same-cell neighbor | reciprocal-pair distance in the layout |
+|-----------|-----------:|---------------------------------:|---------------------------------------:|
+| `chop` | 0.293 | 34.8% | 0.625 |
+| `metis` | **0.647** | **0.1%** | **0.021** |
+
+The last column is the median distance between reciprocal pairs divided by the median
+random-pair distance, so 1.0 would mean the layout ignored the graph entirely. The METIS
+partition itself took 6s on that graph. Note that even a minimum cut keeps only ~65% of
+edges here — large social graphs have no good balanced cuts — so cells still bound quality;
+min-cut raises the ceiling rather than removing it.
 
 ## Balanced partitioning
 

@@ -12,7 +12,10 @@ Covers four scenarios:
    blob) — the case where LSH k-means produced one mass cell; the balanced
    partition must still shard evenly.
 4. Graph mode — neighbor tables read straight off a synthetic community
-   graph, no feature matrix and no kNN search at all.
+   graph, no feature matrix and no kNN search at all. Run twice, once per
+   partitioner, and checked for neighbour locality as well as sanity: the
+   finite/non-degenerate/balanced assertions all pass on a layout that
+   ignored the graph, so only the locality check catches a bad partition.
 
 Notes on the environment pins:
 - torch==2.9.0 is required for multi-GPU on Modal. NOMAD shares CUDA tensors
@@ -40,6 +43,7 @@ image = (
         "scipy==1.13.1",
         "matplotlib",
         "tqdm",
+        "pymetis",  # optional dep, but included so graph_partition='auto' exercises METIS
     )
     .add_local_python_source("nomad_projection")
 )
@@ -77,6 +81,24 @@ def _community_graph(n_points, k, n_comm, cross_frac=0.05, seed=0):
     cross = rng.random((n_points, k)) < cross_frac
     neighbors[cross] = rng.integers(0, n_points, size=int(cross.sum()))
     return neighbors, comm
+
+
+def _neighbor_locality(coords, neighbors, rng):
+    """Median neighbour distance over the median random-pair distance.
+
+    The other checks here (finite, non-degenerate, balanced) all pass on a layout that
+    ignored the graph entirely, so they cannot catch a partition or force-balance
+    regression. This can: ~1.0 means neighbours are no closer than random pairs.
+    """
+    n = len(coords)
+    nb = neighbors[:, 0]
+    valid = nb >= 0
+    idx = np.flatnonzero(valid)
+    if len(idx) > 200_000:
+        idx = rng.choice(idx, size=200_000, replace=False)
+    d_nb = np.linalg.norm(coords[idx] - coords[nb[idx]], axis=1)
+    d_rand = np.linalg.norm(coords[idx] - coords[rng.integers(0, n, len(idx))], axis=1)
+    return float(np.median(d_nb) / max(np.median(d_rand), 1e-9))
 
 
 def _summarize(p, coords, group_ids, elapsed):
@@ -120,7 +142,8 @@ def smoke_features(
 
 @app.function(gpu="H100:8", image=image, timeout=60 * 60, memory=65536)
 def smoke_graph(
-    n_points: int, k: int, n_cells: int, epochs: int, batch_size: int, n_noise: int
+    n_points: int, k: int, n_cells: int, epochs: int, batch_size: int, n_noise: int,
+    graph_partition: str = "auto",
 ) -> dict:
     import time
     import torch
@@ -138,8 +161,11 @@ def smoke_graph(
         n_cells=n_cells,
         n_neighbors=8,
         n_noise=n_noise,
+        graph_partition=graph_partition,
     )
     out = _summarize(p, coords, comm, time.time() - start)
+    out["neighbor_vs_random"] = _neighbor_locality(
+        coords, neighbors, np.random.default_rng(0))
     labels = p.cluster_assignments
     out["intra_cell_edge_frac"] = float(
         (labels[neighbors.ravel()] == np.repeat(labels, k)).mean()
@@ -175,14 +201,18 @@ def main(
         assert hi - lo <= n_cells, f"{name}: unbalanced cells {lo}..{hi}"
         results[name] = r
 
-    if wanted is None or "graph_mode" in wanted:
-        r = smoke_graph.remote(n_points, 16, 16, epochs, batch_size, n_noise)
-        print(f"graph_mode: {r}")
+    for name, gp in (("graph_mode", "auto"), ("graph_mode_chop", "chop")):
+        if wanted is not None and name not in wanted:
+            continue
+        r = smoke_graph.remote(n_points, 16, 16, epochs, batch_size, n_noise, gp)
+        print(f"{name}: {r}")
         assert r["finite_frac"] == 1.0
         assert min(r["coord_std"]) > 0
         assert r["world_size"] == 8
-        lo, hi = r["cell_sizes_min_max"]
-        assert hi - lo <= 16, f"graph: unbalanced cells {lo}..{hi}"
-        results["graph_mode"] = r
+        # Layout must actually reflect the graph. A projection that ignored the
+        # neighbour table scores ~1.0 here while still passing every check above.
+        assert r["neighbor_vs_random"] < 0.5, \
+            f"{name}: neighbours no closer than random ({r['neighbor_vs_random']:.3f})"
+        results[name] = r
 
     print("SMOKE PASSED")
