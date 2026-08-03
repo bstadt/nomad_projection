@@ -91,6 +91,38 @@ partition itself took 6s on that graph. Note that even a minimum cut keeps only 
 edges here — large social graphs have no good balanced cuts — so cells still bound quality;
 min-cut raises the ceiling rather than removing it.
 
+## Late exaggeration
+
+Attraction can be boosted for the tail of training, the way t-SNE's early exaggeration works but
+inverted: let the layout spread first, then pull it onto its structure. `pos_weight` becomes
+`late_exaggeration_scale` once `t = epoch/epochs` passes `late_exaggeration_time`.
+
+**This did not work before.** `late_exaggeration_time` defaulted to `1.1` while `t` never exceeds
+`1.0`, so the branch was unreachable and `late_exaggeration_scale` and `late_exaggeration_n_noise`
+were silently ignored in every run. The default is now `0.6`; with `late_exaggeration_scale=1`
+(unchanged) and `late_exaggeration_n_noise` following `n_noise`, the defaults still behave exactly
+as before — the parameters simply do something when you set them. A time `>= 1.0` now warns.
+
+The two knobs are not independent. What predicts the result is **`(1 - t) x scale`** — how long the
+boost runs times how hard it pulls. On a 630k-node repost graph (k=8, 800 epochs, 8 GPUs):
+
+| t | scale | (1-t)&times;scale | extent | occupied bins | result |
+|---|-------|------------|--------|---------------|--------|
+| — | 1 (off) | 0 | 28.0 | 39% | uniform grain, no structure legible |
+| 0.3 | 2 | 1.4 | 21.1 | 18% | soft clumping |
+| **0.6** | **4** | **1.6** | 21.1 | 14% | **cleanly separated clusters with filaments** |
+| 0.3 | 3 | 2.1 | 14.4 | 11% | filaments radiating from a dense core |
+| 0.6 | 8 | 3.2 | 14.5 | 6% | sharpest separation, sparser field |
+| 0.3 | 8 | 5.6 | 2.4 | 2% | over-collapsed |
+| 0.3 | 32 | 22.4 | 0.72 | 2% | crushed to a point cloud |
+
+Useful structure lives around 1.5-2; past ~3 the layout implodes.
+
+Note that raising attraction is not interchangeable with lowering repulsion. Cutting `n_noise`
+reduces the runaway growth of the embedding but produces no cluster structure, and taken far enough
+(`n_noise=16`) it yields a ring: with random negatives that sparse, the mean-affinity term — each
+point repelled from the other cells' centroids — dominates and evacuates the middle.
+
 ## Balanced partitioning
 
 Centroid-based clustering (upstream's LSH k-means) can put nearly all points into one cell on heavy-tailed data — one mass cell OOMs the per-cell kNN and shards terribly across GPUs. This fork's default partition (`partition='balanced'`) is recursive bisection along principal directions with the cut at the *rank* quantile, so cell sizes are exact (within ±1 point per split) by construction, on any data distribution. Every GPU gets an identically-sized shard. The upstream behavior remains available with `partition='lsh'`.
