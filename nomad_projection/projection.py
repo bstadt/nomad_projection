@@ -206,8 +206,13 @@ class NomadProjection:
         local_knn = torch.cat(local_knn, axis=0).to(f'cuda:{rank}')
 
         n_neighbors = torch.tensor(n_neighbors, device=f'cuda:{rank}')
+        # _step already returns loss.item(), so accumulating the trajectory is free.
+        # It is otherwise unrecoverable: training runs in spawned processes, so a
+        # caller can only scrape stdout, and only on even epochs.
+        loss_log = []
         for epoch in range(epochs):
-            
+
+            epoch_loss_sum, epoch_steps = 0.0, 0
             t = epoch/epochs
             cur_n_noise = n_noise_schedule(t)
             cur_pos_weight = pos_weight_schedule(t)
@@ -225,6 +230,9 @@ class NomadProjection:
                                   neg_weight=1,
                                   context=context)
 
+                epoch_loss_sum += loss
+                epoch_steps += 1
+
                 if not epoch % 2 and not rank:
                     print('t: {:.4f}'.format(t),
                           '\tdevice:{}'.format(rank),
@@ -234,6 +242,18 @@ class NomadProjection:
                 # Update learning rate and momentum
                 for param_group in self._optim.param_groups:
                     param_group['lr'] = cur_lr
+
+            if not rank and epoch_steps:
+                loss_log.append({'epoch': epoch, 't': t,
+                                 'loss': epoch_loss_sum / epoch_steps,
+                                 'pos_weight': cur_pos_weight, 'lr': cur_lr})
+
+        loss_path = os.environ.get('NOMAD_LOSS_PATH')
+        if not rank and loss_path:
+            import json
+            with open(loss_path, 'w') as f:
+                json.dump(loss_log, f)
+            print(f'wrote {len(loss_log)} epoch losses to {loss_path}', flush=True)
 
 
     def fit_transform(self,

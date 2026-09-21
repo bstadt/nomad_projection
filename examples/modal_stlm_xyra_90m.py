@@ -174,8 +174,8 @@ def build_neighbors(k: int = 16, n_buckets: int = 16):
     return stats
 
 
-@app.function(image=metis_image, volumes={"/vol": vol}, cpu=16, memory=196608,
-              timeout=12 * 3600)
+@app.function(image=metis_image, volumes={"/vol": vol}, cpu=16, memory=98304,
+              timeout=12 * 3600, retries=3)
 def partition(n_cells: int = 16, k_part: int = 6, k: int = 16, method: str = "metis"):
     """Cells for graph mode, as a standalone CPU job.
 
@@ -250,13 +250,19 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
             batch_size: int = 40000, n_noise: int = 2000, n_neighbors: int = 8,
             lr_scale: float = 0.015, late_exaggeration_time: float = 0.6,
             late_exaggeration_scale: float = 4.0):
+    import json
+    import os
     import time
 
     import numpy as np
     import torch
+
+    loss_path = f"/vol/loss_{tag}.json"
+    os.environ["NOMAD_LOSS_PATH"] = loss_path
     from nomad_projection import NomadProjection
 
-    print(f"visible GPUs: {torch.cuda.device_count()}, torch {torch.__version__}",
+    print(f"visible GPUs: {torch.cuda.device_count()}, torch {torch.__version__},"
+          f" late_exaggeration_scale={late_exaggeration_scale}",
           flush=True)
     neighbors = np.load(f"/vol/neighbors_k{k}.npy")
     labels = np.load(f"/vol/{labels_file}")
@@ -290,15 +296,37 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
     d_rand = np.linalg.norm(
         coords[idx[ok]] - coords[rng.integers(0, N_NODES, ok.sum())], axis=1)
 
+    # extent / occupied-bin fraction, the two structure measures the fork's
+    # late-exaggeration table is reported in, so runs are comparable to it.
+    sub = coords[rng.choice(N_NODES, 5_000_000, replace=False)]
+    lo = np.percentile(sub, 0.1, axis=0)
+    hi = np.percentile(sub, 99.9, axis=0)
+    bins = 1000
+    ix = np.clip(((sub - lo) / np.maximum(hi - lo, 1e-9) * bins).astype(np.int32),
+                 0, bins - 1)
+    occupied = len(np.unique(ix[:, 0].astype(np.int64) * bins + ix[:, 1]))
+
     stats = {
         "tag": tag,
+        "lr_scale": lr_scale,
         "seconds": round(elapsed, 1),
         "world_size": p.world_size,
         "epochs": epochs,
         "finite_frac": float(np.isfinite(coords).all(axis=1).mean()),
         "coord_std": [float(coords[:, 0].std()), float(coords[:, 1].std())],
         "neighbor_vs_random": float(np.median(d_nb) / max(np.median(d_rand), 1e-9)),
+        "extent": float(np.mean(hi - lo)),
+        "occupied_bin_frac": occupied / (bins * bins),
+        "late_exaggeration_scale": late_exaggeration_scale,
     }
+    if os.path.exists(loss_path):
+        with open(loss_path) as f:
+            hist = json.load(f)
+        stats["loss_first"] = round(hist[0]["loss"], 4)
+        stats["loss_min"] = round(min(h["loss"] for h in hist), 4)
+        stats["loss_final"] = round(hist[-1]["loss"], 4)
+        stats["loss_curve"] = [(h["epoch"], round(h["loss"], 4))
+                               for h in hist[::max(len(hist) // 12, 1)]]
     print(stats, flush=True)
     vol.commit()
     return stats
@@ -333,8 +361,13 @@ def render(tag: str, width: int = 4000, height: int = 4000, pct: float = 0.02,
 
     df = pd.DataFrame({"x": coords[:, 0], "y": coords[:, 1]})
     if color_by_degree:
-        deg = np.load("/vol/degrees.npy")[good]
-        df["logdeg"] = np.log10(np.maximum(deg, 1)).astype(np.float32)
+        deg = np.load("/vol/degrees.npy")
+        if deg.shape[0] != good.shape[0]:
+            print(f"degrees.npy is {deg.shape[0]} long, coords are {good.shape[0]}; "
+                  "skipping the degree render", flush=True)
+            color_by_degree = False
+        else:
+            df["logdeg"] = np.log10(np.maximum(deg[good], 1)).astype(np.float32)
 
     cvs = ds.Canvas(plot_width=width, plot_height=height,
                     x_range=x_range, y_range=y_range)
@@ -365,9 +398,80 @@ def render(tag: str, width: int = 4000, height: int = 4000, pct: float = 0.02,
     return blobs
 
 
+@app.function(image=viz_image, volumes={"/vol": vol}, cpu=16, memory=131072,
+              timeout=2 * 3600)
+def render_core(tag: str, width: int = 4000, frame_min_degree: int = 8,
+                min_degrees: str = "0,4,8", pct: float = 0.5):
+    """Renders framed on the connected core rather than on the whole point cloud.
+
+    Framing by percentile over all 97.8M accounts is dominated by the low-degree
+    halo: median degree is 3, so tens of millions of accounts carry almost no
+    attractive force and repulsion alone spreads them into a featureless
+    Gaussian that fills the frame and hides the structure. Taking the window
+    from the high-degree subgraph instead puts the frame where the graph
+    actually has structure; min_degrees then controls which accounts are drawn
+    inside it.
+    """
+    import time
+
+    import colorcet
+    import datashader as ds
+    import datashader.transfer_functions as tf
+    import numpy as np
+    import pandas as pd
+
+    t0 = time.time()
+    coords = np.load(f"/vol/coords_{tag}.npy")
+    deg = np.load("/vol/degrees.npy")
+    good = np.isfinite(coords).all(axis=1)
+    coords, deg = coords[good], deg[good]
+
+    core = coords[deg >= frame_min_degree]
+    x_range = tuple(np.percentile(core[:, 0], [pct, 100 - pct]))
+    y_range = tuple(np.percentile(core[:, 1], [pct, 100 - pct]))
+    print(f"frame from {len(core)} accounts with deg>={frame_min_degree}: "
+          f"x {x_range} y {y_range}", flush=True)
+
+    out = {}
+    for md in [int(m) for m in min_degrees.split(",")]:
+        sel = deg >= md if md > 0 else slice(None)
+        xy = coords[sel]
+        df = pd.DataFrame({"x": xy[:, 0], "y": xy[:, 1]})
+        cvs = ds.Canvas(plot_width=width, plot_height=width,
+                        x_range=x_range, y_range=y_range)
+        img = tf.set_background(
+            tf.shade(cvs.points(df, "x", "y"), cmap=colorcet.fire, how="eq_hist"),
+            "black")
+        path = f"/vol/core_{tag}_deg{md}_{width}.png"
+        img.to_pil().save(path)
+        out[f"deg{md}"] = path
+        print(f"deg>={md}: {len(xy)} accounts, {time.time() - t0:.0f}s", flush=True)
+
+    # degree-coloured, same frame
+    df = pd.DataFrame({"x": coords[:, 0], "y": coords[:, 1],
+                       "logdeg": np.log10(np.maximum(deg, 1)).astype(np.float32)})
+    cvs = ds.Canvas(plot_width=width, plot_height=width,
+                    x_range=x_range, y_range=y_range)
+    img = tf.set_background(
+        tf.shade(cvs.points(df, "x", "y", ds.mean("logdeg")),
+                 cmap=colorcet.bmy, how="linear"), "black")
+    path = f"/vol/core_{tag}_degcolor_{width}.png"
+    img.to_pil().save(path)
+    out["degcolor"] = path
+
+    vol.commit()
+    blobs = {}
+    for name, path in out.items():
+        with open(path, "rb") as f:
+            blobs[name] = f.read()
+        print(f"{name}: {len(blobs[name]) / 1e6:.1f} MB", flush=True)
+    return blobs
+
+
 @app.local_entrypoint()
 def main(stage: str = "all", tag: str = "c16metis", labels_file: str = "",
-         epochs: int = 200, n_cells: int = 16):
+         epochs: int = 200, n_cells: int = 16, lr_scale: float = 0.015,
+         late_exaggeration_scale: float = 4.0):
     import os
 
     if stage in ("all", "fetch"):
@@ -380,8 +484,17 @@ def main(stage: str = "all", tag: str = "c16metis", labels_file: str = "",
         labels_file = st["labels_file"]
     if stage in ("all", "project"):
         assert labels_file, "pass --labels-file"
-        print("project:", project.remote(labels_file=labels_file, tag=tag,
-                                         epochs=epochs))
+        print("project:", project.remote(
+            labels_file=labels_file, tag=tag, epochs=epochs, lr_scale=lr_scale,
+            late_exaggeration_scale=late_exaggeration_scale))
+    if stage == "core":
+        blobs = render_core.remote(tag=tag)
+        os.makedirs("out", exist_ok=True)
+        for name, data in blobs.items():
+            p = f"out/xyra90m_{tag}_core_{name}.png"
+            with open(p, "wb") as f:
+                f.write(data)
+            print(f"wrote {p} ({len(data) / 1e6:.1f} MB)")
     if stage in ("all", "render"):
         blobs = render.remote(tag=tag)
         os.makedirs("out", exist_ok=True)
