@@ -243,6 +243,7 @@ class NomadProjection:
             neighbors=None,
             partition='balanced',
             graph_partition='auto',
+            cell_labels=None,
             n_cells=5,
             cluster_chunk_size=2000,
             n_neighbors=8,
@@ -268,6 +269,12 @@ class NomadProjection:
           graph. Cells come from X (balanced partition) when X is also
           given, otherwise from `graph_partition`. X, when present alongside
           neighbors, is used only for partitioning and PCA init.
+
+        cell_labels, when given, overrides both partitioners with a
+        precomputed (n,) cell assignment and sets n_cells from it. Partitioning
+        a large graph (METIS on 10^8 nodes) is a long CPU job with no use for a
+        GPU, so it is worth running separately and passing the result in rather
+        than paying for idle accelerators while it runs.
 
         graph_partition selects how graph-mode cells are formed:
           'auto'   metis when pymetis is installed, else 'chop' (default)
@@ -303,7 +310,15 @@ class NomadProjection:
             neighbors = np.asarray(neighbors)
             if X is not None and X.shape[0] != neighbors.shape[0]:
                 raise ValueError('X and neighbors disagree on n')
-            if X is not None:
+            if cell_labels is not None:
+                labels = np.asarray(cell_labels, dtype=np.int64)
+                if labels.shape != (n,):
+                    raise ValueError(
+                        f'cell_labels must be shape ({n},), got {labels.shape}')
+                n_cells = int(labels.max()) + 1
+                print(f'using precomputed cell_labels: {n_cells} cells, sizes '
+                      f'{np.bincount(labels).min()}..{np.bincount(labels).max()}')
+            elif X is not None:
                 labels = balanced_partition_labels(X, n_cells)
             else:
                 labels = _graph_labels(neighbors, n_cells, graph_partition)
