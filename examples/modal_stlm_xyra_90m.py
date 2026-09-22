@@ -249,7 +249,8 @@ def partition(n_cells: int = 16, k_part: int = 6, k: int = 16, method: str = "me
 def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
             batch_size: int = 40000, n_noise: int = 2000, n_neighbors: int = 8,
             lr_scale: float = 0.015, late_exaggeration_time: float = 0.6,
-            late_exaggeration_scale: float = 4.0):
+            late_exaggeration_scale: float = 4.0,
+            cell_repulsion_weight: str = "auto"):
     import json
     import os
     import time
@@ -281,6 +282,8 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
         lr_scale=lr_scale,
         late_exaggeration_time=late_exaggeration_time,
         late_exaggeration_scale=late_exaggeration_scale,
+        cell_repulsion_weight=(cell_repulsion_weight if cell_repulsion_weight == "auto"
+                               else float(cell_repulsion_weight)),
     )
     elapsed = time.time() - t0
     coords = np.asarray(coords, dtype=np.float32)
@@ -318,7 +321,26 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
         "extent": float(np.mean(hi - lo)),
         "occupied_bin_frac": occupied / (bins * bins),
         "late_exaggeration_scale": late_exaggeration_scale,
+        "cell_repulsion_weight": cell_repulsion_weight,
     }
+
+    # Do the cells occupy their own territory, or sit superimposed? This is the
+    # thing cell_repulsion_weight exists to fix, and neighbor_vs_random is blind
+    # to it (GraphKNN only ever keeps same-cell neighbours).
+    import itertools
+    cents, spreads = [], []
+    for c in range(int(labels.max()) + 1):
+        pts = coords[labels == c]
+        mu = pts.mean(axis=0)
+        cents.append(mu)
+        spreads.append(float(np.sqrt(((pts - mu) ** 2).sum(axis=1).mean())))
+    cents = np.stack(cents)
+    pair_d = [float(np.linalg.norm(cents[i] - cents[j]))
+              for i, j in itertools.combinations(range(len(cents)), 2)]
+    stats["median_centroid_distance"] = round(float(np.median(pair_d)), 3)
+    stats["median_within_cell_spread"] = round(float(np.median(spreads)), 3)
+    stats["separation_ratio"] = round(
+        float(np.median(pair_d) / max(np.median(spreads), 1e-9)), 4)
     if os.path.exists(loss_path):
         with open(loss_path) as f:
             hist = json.load(f)
@@ -468,10 +490,167 @@ def render_core(tag: str, width: int = 4000, frame_min_degree: int = 8,
     return blobs
 
 
+@app.function(image=viz_image, volumes={"/vol": vol}, cpu=16, memory=131072,
+              timeout=3600)
+def centroid_voids(tag: str, labels_file: str = "labels_metis_c16.npy",
+                   radius: float = 1.0):
+    """Test whether the small voids in the layout sit on the cell centroids.
+
+    _step repels every point from the *other* cells' centroids (the
+    mean-affinity term). If that force is strong enough it should evacuate a
+    neighbourhood of each centroid, leaving one hole per cell. Compares point
+    density within `radius` of each centroid against the density in an annulus
+    at the same distance from the origin, which controls for the layout being
+    centrally concentrated.
+    """
+    import numpy as np
+
+    coords = np.load(f"/vol/coords_{tag}.npy")
+    labels = np.load(f"/vol/{labels_file}")
+    good = np.isfinite(coords).all(axis=1)
+    coords, labels = coords[good], labels[good]
+
+    r_all = np.linalg.norm(coords, axis=1)
+    out = []
+    for c in range(int(labels.max()) + 1):
+        mu = coords[labels == c].mean(axis=0)
+        d = np.linalg.norm(coords - mu, axis=1)
+        n_near = int((d < radius).sum())
+        r_mu = float(np.linalg.norm(mu))
+        # control: same-|r| annulus, same area
+        band = np.abs(r_all - r_mu) < radius
+        area_band = max(2 * np.pi * max(r_mu, radius) * 2 * radius, 1e-9)
+        expected = band.sum() * (np.pi * radius ** 2) / area_band
+        out.append({
+            "cell": c,
+            "centroid": [round(float(mu[0]), 3), round(float(mu[1]), 3)],
+            "r": round(r_mu, 3),
+            "observed": n_near,
+            "expected": int(expected),
+            "ratio": round(n_near / max(expected, 1e-9), 4),
+        })
+    ratios = [o["ratio"] for o in out]
+    print(f"density at centroid / expected: median {np.median(ratios):.4f}, "
+          f"min {min(ratios):.4f}, max {max(ratios):.4f}", flush=True)
+    for o in out:
+        print(o, flush=True)
+    return {"per_cell": out, "median_ratio": float(np.median(ratios))}
+
+
+@app.function(image=viz_image, volumes={"/vol": vol}, cpu=16, memory=131072,
+              timeout=3600)
+def cell_overlap(tag: str, labels_file: str = "labels_metis_c16.npy"):
+    """Do the cells occupy distinct regions of the layout, or sit on top of each other?
+
+    Each cell is a separate parameter tensor, randomly initialised, and cells
+    interact only through the mean-affinity term (repulsion from the other
+    cells' centroids). If that coupling is weak, every cell independently
+    expands into its own blob about the origin and the 16 layouts end up
+    superimposed -- in which case the partition's quality is invisible in the
+    picture no matter how good the cut was.
+
+    separation = median distance between cell centroids / median within-cell
+    spread. >>1 means cells occupy their own territory; <<1 means superimposed.
+    """
+    import itertools
+
+    import numpy as np
+
+    coords = np.load(f"/vol/coords_{tag}.npy")
+    labels = np.load(f"/vol/{labels_file}")
+    good = np.isfinite(coords).all(axis=1)
+    coords, labels = coords[good], labels[good]
+    n_cells = int(labels.max()) + 1
+
+    cents, spreads = [], []
+    for c in range(n_cells):
+        pts = coords[labels == c]
+        mu = pts.mean(axis=0)
+        cents.append(mu)
+        spreads.append(float(np.sqrt(((pts - mu) ** 2).sum(axis=1).mean())))
+    cents = np.stack(cents)
+
+    pair_d = [float(np.linalg.norm(cents[i] - cents[j]))
+              for i, j in itertools.combinations(range(n_cells), 2)]
+
+    res = {
+        "n_cells": n_cells,
+        "median_centroid_distance": round(float(np.median(pair_d)), 3),
+        "max_centroid_distance": round(float(max(pair_d)), 3),
+        "median_within_cell_spread": round(float(np.median(spreads)), 3),
+        "separation_ratio": round(float(np.median(pair_d) / np.median(spreads)), 4),
+        "layout_rms_radius": round(float(np.sqrt((coords ** 2).sum(axis=1).mean())), 3),
+    }
+    print(res, flush=True)
+    print("per-cell spread:", [round(s, 1) for s in spreads], flush=True)
+    return res
+
+
+@app.function(image=viz_image, volumes={"/vol": vol}, cpu=16, memory=131072,
+              timeout=3600)
+def force_balance(tag: str, labels_file: str = "labels_metis_c16.npy",
+                  n_noise: int = 2000, sample: int = 200_000):
+    """How much of the negative force is cross-cell centroid repulsion?
+
+    _step sums both into one log: negkerns over n_noise random negatives, and
+    dist_negkerns over the other cells' centroids. Both use the 1/(1+d^2)
+    kernel, so the centroid term is negligible at typical separations but
+    enormous within ~1 unit -- a short-range hard core rather than a force that
+    could push cells apart. Measures the actual ratio on a finished layout.
+    """
+    import numpy as np
+
+    coords = np.load(f"/vol/coords_{tag}.npy").astype(np.float64)
+    labels = np.load(f"/vol/{labels_file}")
+    good = np.isfinite(coords).all(axis=1)
+    coords, labels = coords[good], labels[good]
+    n_cells = int(labels.max()) + 1
+    rng = np.random.default_rng(0)
+
+    cents = np.stack([coords[labels == c].mean(axis=0) for c in range(n_cells)])
+
+    idx = rng.choice(len(coords), sample, replace=False)
+    pts, pl = coords[idx], labels[idx]
+
+    # negkerns: n_noise random same-cell partners (noise is drawn from the
+    # rank's own points), summed 1/(1+d^2)
+    noise = coords[rng.choice(len(coords), n_noise, replace=False)]
+    d2 = ((pts[:, None, :] - noise[None, :, :]) ** 2).sum(-1)
+    negkerns = (1.0 / (1.0 + d2)).sum(1)
+
+    # dist_negkerns: the 14 centroids on other ranks (2 cells/rank, 8 ranks)
+    d2c = ((pts[:, None, :] - cents[None, :, :]) ** 2).sum(-1)
+    own_rank = (pl % 8)
+    cell_rank = np.arange(n_cells) % 8
+    mask_other_rank = cell_rank[None, :] != own_rank[:, None]
+    kc = 1.0 / (1.0 + d2c)
+    dist_negkerns = np.where(mask_other_rank, kc, 0.0).sum(1)
+
+    near1 = float((np.sqrt(d2c).min(1) < 1.0).mean())
+    near3 = float((np.sqrt(d2c).min(1) < 3.0).mean())
+
+    res = {
+        "mean_negkerns": float(negkerns.mean()),
+        "mean_dist_negkerns": float(dist_negkerns.mean()),
+        "centroid_share_of_negative_mass": float(
+            dist_negkerns.mean() / (negkerns.mean() + dist_negkerns.mean())),
+        "median_centroid_share": float(np.median(
+            dist_negkerns / (negkerns + dist_negkerns))),
+        "frac_points_within_1_of_a_centroid": near1,
+        "frac_points_within_3_of_a_centroid": near3,
+        "layout_rms_radius": float(np.sqrt((coords ** 2).sum(1).mean())),
+        "n_noise": n_noise,
+        "n_other_centroids": int(mask_other_rank.sum(1)[0]),
+    }
+    print(res, flush=True)
+    return res
+
+
 @app.local_entrypoint()
 def main(stage: str = "all", tag: str = "c16metis", labels_file: str = "",
          epochs: int = 200, n_cells: int = 16, lr_scale: float = 0.015,
-         late_exaggeration_scale: float = 4.0):
+         late_exaggeration_scale: float = 4.0,
+         cell_repulsion_weight: str = "auto"):
     import os
 
     if stage in ("all", "fetch"):
@@ -486,7 +665,14 @@ def main(stage: str = "all", tag: str = "c16metis", labels_file: str = "",
         assert labels_file, "pass --labels-file"
         print("project:", project.remote(
             labels_file=labels_file, tag=tag, epochs=epochs, lr_scale=lr_scale,
-            late_exaggeration_scale=late_exaggeration_scale))
+            late_exaggeration_scale=late_exaggeration_scale,
+            cell_repulsion_weight=cell_repulsion_weight))
+    if stage == "force":
+        print("force_balance:", force_balance.remote(tag=tag))
+    if stage == "overlap":
+        print("cell_overlap:", cell_overlap.remote(tag=tag))
+    if stage == "voids":
+        print("centroid_voids:", centroid_voids.remote(tag=tag)["median_ratio"])
     if stage == "core":
         blobs = render_core.remote(tag=tag)
         os.makedirs("out", exist_ok=True)

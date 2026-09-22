@@ -92,19 +92,30 @@ class NomadProjection:
               pos_weight,
               neg_weight,
               do_gather,
-              context):
+              context,
+              cell_of_row=None,
+              mu_cell_ids=None,
+              cell_repulsion_weight=1.0):
 
             x = torch.cat([self._model[model_num] for model_num in model_idxs], axis=0)
             mus = torch.stack([self._model[model_num].mean(dim=0) for model_num in model_idxs], axis=0)
 
+            n_cells_total = len(self._model)
             if do_gather:
                 mu_container = []
                 for i in range(self.world_size):
                     models_on_rank = len([ k for k, gpu in self.gpu_cluster_map.items() if gpu == i])
                     mu_container.append(torch.zeros(models_on_rank, mus.size(1), device=f'cuda:{rank}'))
                 torch.distributed.all_gather(mu_container, mus)
-                other_mus = torch.cat([m for i, m in enumerate(mu_container) if i != rank], dim=0)
+                # Every cell's centroid. This previously dropped all cells living
+                # on the local rank, so with n_cells > world_size a point was never
+                # repelled from the other cells sharing its GPU (2 of 16 at
+                # n_cells=16 on 8 GPUs). Rows are rank-major; mu_cell_ids carries
+                # the matching global cell id so a point can mask its own.
+                all_mus = torch.cat(mu_container, dim=0)
                 del mus
+            else:
+                all_mus = mus
 
             n = x.size(0) 
             with context:
@@ -134,10 +145,17 @@ class NomadProjection:
                 pji = exp_ranks / sum_exp_ranks
                 pji = pji.reshape(1, -1)
 
-                if do_gather:
-                    dist_negatives = ((target_embs.reshape(cur_batch_size, 1, 2) - other_mus)**2).sum(axis=-1)
+                if n_cells_total > 1 and cell_of_row is not None and mu_cell_ids is not None:
+                    dist_negatives = ((target_embs.reshape(cur_batch_size, 1, 2) - all_mus)**2).sum(axis=-1)
                     dist_negkerns_single = 1 / (1 + dist_negatives)
-                    dist_negkerns = dist_negkerns_single.sum(dim=1, keepdim=True).expand(-1, n_neighbors) 
+                    # Mask each point's OWN cell rather than its whole rank, so
+                    # every cell supplies negatives to every other cell.
+                    own_cell = cell_of_row[target_idxs]
+                    dist_negkerns_single = dist_negkerns_single.masked_fill(
+                        own_cell.unsqueeze(1) == mu_cell_ids.unsqueeze(0), 0.0)
+                    dist_negkerns = (cell_repulsion_weight
+                                     * dist_negkerns_single.sum(dim=1, keepdim=True)
+                                     ).expand(-1, n_neighbors)
                 else:
                     dist_negkerns = torch.zeros_like(negkerns)
 
@@ -162,7 +180,8 @@ class NomadProjection:
                      late_exaggeration_n_noise,
                      lr_scale,
                      learning_rate_decay_start_time,
-                     distributed):
+                     distributed,
+                     cell_repulsion_weight='auto'):
 
         # derive schedules
         def n_noise_schedule(t):
@@ -199,11 +218,23 @@ class NomadProjection:
 
         model_idxs = [i for i in range(len(self._model)) if self.gpu_cluster_map[i] == rank]
         local_knn = []
+        cell_rows = []
         offset = 0
         for i in model_idxs:
             local_knn.append(torch.tensor(self._knn[i] + offset))
+            cell_rows.append(torch.full((self._knn[i].shape[0],), i, dtype=torch.long))
             offset += self._knn[i].shape[0]
         local_knn = torch.cat(local_knn, axis=0).to(f'cuda:{rank}')
+        # Global cell id per row of x, so _step can mask a point's own cell.
+        cell_of_row = torch.cat(cell_rows, axis=0).to(f'cuda:{rank}')
+
+        n_cells_total = len(self._model)
+        # Global cell id for each row of torch.cat(mu_container): rank-major,
+        # matching how all_gather lays out the per-rank centroid blocks.
+        mu_cell_ids = torch.tensor(
+            [c for i in range(self.world_size) for c in range(n_cells_total)
+             if self.gpu_cluster_map[c] == i] if distributed else list(model_idxs),
+            dtype=torch.long, device=f'cuda:{rank}')
 
         n_neighbors = torch.tensor(n_neighbors, device=f'cuda:{rank}')
         # _step already returns loss.item(), so accumulating the trajectory is free.
@@ -217,6 +248,15 @@ class NomadProjection:
             cur_n_noise = n_noise_schedule(t)
             cur_pos_weight = pos_weight_schedule(t)
             cur_lr = lr_schedule(t)
+            # 'auto' puts one centroid on the same footing as one random
+            # negative: the centroid sum has n_cells-1 terms against n_noise,
+            # so unweighted it is ~1% of the negative mass and only acts within
+            # ~1 unit of a centroid -- it punches a hole rather than separating
+            # cells. See examples/modal_stlm_xyra_90m.py::force_balance.
+            if cell_repulsion_weight == 'auto':
+                cur_cell_w = cur_n_noise / max(n_cells_total - 1, 1)
+            else:
+                cur_cell_w = float(cell_repulsion_weight)
             for step in range(n//(batch_size * self.world_size)):
                 self._optim.zero_grad()
                 loss = self._step(model_idxs=model_idxs,
@@ -228,7 +268,10 @@ class NomadProjection:
                                   pos_weight=cur_pos_weight,
                                   do_gather=distributed,
                                   neg_weight=1,
-                                  context=context)
+                                  context=context,
+                                  cell_of_row=cell_of_row,
+                                  mu_cell_ids=mu_cell_ids,
+                                  cell_repulsion_weight=cur_cell_w)
 
                 epoch_loss_sum += loss
                 epoch_steps += 1
@@ -237,7 +280,8 @@ class NomadProjection:
                     print('t: {:.4f}'.format(t),
                           '\tdevice:{}'.format(rank),
                           '\tloss: {:.4f}'.format(loss),
-                          '\tcur_lr: {}'.format(cur_lr))
+                          '\tcur_lr: {}'.format(cur_lr),
+                          '\tcell_w: {:.2f}'.format(cur_cell_w))
 
                 # Update learning rate and momentum
                 for param_group in self._optim.param_groups:
@@ -275,6 +319,7 @@ class NomadProjection:
             learning_rate_decay_start_time=0.3,
             lr_scale=0.1,
             cluster_subset_size=5000000,
+            cell_repulsion_weight='auto',
             debug_plot=False,
            ):
         """Project to 2D.
@@ -289,6 +334,17 @@ class NomadProjection:
           graph. Cells come from X (balanced partition) when X is also
           given, otherwise from `graph_partition`. X, when present alongside
           neighbors, is used only for partitioning and PCA init.
+
+        cell_repulsion_weight scales the repulsion of every point from the
+        other cells' centroids. Cells are otherwise coupled by nothing else, so
+        this is the only force that can keep them from being laid out on top of
+        one another. Unweighted the term contributes n_cells-1 summands against
+        n_noise (2000), i.e. ~1% of the negative mass, and since the kernel is
+        1/(1+d^2) it only bites within ~1 unit -- measured on a 97.8M-node
+        graph it carved a hole at each centroid while the 16 cells stayed fully
+        superimposed (median centroid separation 15 against within-cell spread
+        119). 'auto' (default) uses n_noise/(n_cells-1), putting one centroid on
+        the same footing as one random negative; pass 1.0 for the old behaviour.
 
         cell_labels, when given, overrides both partitioners with a
         precomputed (n,) cell assignment and sets n_cells from it. Partitioning
@@ -414,7 +470,8 @@ class NomadProjection:
                         late_exaggeration_n_noise,
                         lr_scale,
                         learning_rate_decay_start_time,
-                        distributed),
+                        distributed,
+                        cell_repulsion_weight),
                     join=True)
         else:
             self.train_on_gpu(rank=0,
@@ -428,7 +485,8 @@ class NomadProjection:
                               late_exaggeration_n_noise=late_exaggeration_n_noise,
                               lr_scale=lr_scale,
                               learning_rate_decay_start_time=learning_rate_decay_start_time,
-                              distributed=distributed)
+                              distributed=distributed,
+                              cell_repulsion_weight=cell_repulsion_weight)
 
         # Collect final embeddings in the order of input data
         final_embeddings = torch.zeros((len(self.cluster_assignments), 2), dtype=torch.float32)
