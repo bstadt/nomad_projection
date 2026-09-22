@@ -174,9 +174,67 @@ def build_neighbors(k: int = 16, n_buckets: int = 16):
     return stats
 
 
+@app.function(image=cpu_image, volumes={"/vol": vol}, cpu=16, memory=98304,
+              timeout=4 * 3600)
+def build_subgraph(min_degree: int = 8, k: int = 16):
+    """Neighbor table for the subgraph induced on accounts with deg >= min_degree.
+
+    The low-degree tail is most of the graph (median degree 3) and carries
+    almost no community structure: it has too little attractive force to be
+    placed, so repulsion spreads it into a halo that overlaps every cell at
+    once. Dropping it before the projection - rather than filtering at render
+    time - means the optimizer never spends capacity on it and the partition is
+    computed over the part of the graph that actually has communities.
+    """
+    import time
+
+    import numpy as np
+
+    t0 = time.time()
+    neighbors = np.load(f"/vol/neighbors_k{k}.npy")
+    deg = np.load("/vol/degrees.npy")
+    n = neighbors.shape[0]
+
+    keep = deg >= min_degree
+    m = int(keep.sum())
+    old2new = np.full(n, -1, dtype=np.int32)
+    old2new[keep] = np.arange(m, dtype=np.int32)
+
+    nb = neighbors[keep]
+    del neighbors
+    valid = nb >= 0
+    # Map surviving neighbours to new ids; neighbours that fell below the cut
+    # become -1, then get pushed to the end so each row stays ordered by weight.
+    mapped = np.where(valid, old2new[np.where(valid, nb, 0)], np.int32(-1))
+    del nb, valid
+    order = np.argsort(mapped < 0, axis=1, kind="stable")
+    out = np.take_along_axis(mapped, order, axis=1)
+    del mapped, order
+
+    np.save(f"/vol/neighbors_deg{min_degree}_k{k}.npy", out)
+    np.save(f"/vol/degrees_deg{min_degree}.npy", deg[keep])
+    np.save(f"/vol/keep_deg{min_degree}.npy", np.flatnonzero(keep).astype(np.int32))
+
+    filled = (out >= 0).sum(axis=1)
+    stats = {
+        "min_degree": min_degree,
+        "nodes": m,
+        "dropped": int(n - m),
+        "edges_kept": int(filled.sum()),
+        "edges_before": int((deg[keep].clip(max=k)).sum()),
+        "isolated_after": int((filled == 0).sum()),
+        "mean_row_filled": float(filled.mean()),
+        "seconds": round(time.time() - t0, 1),
+    }
+    print(stats, flush=True)
+    vol.commit()
+    return stats
+
+
 @app.function(image=metis_image, volumes={"/vol": vol}, cpu=16, memory=98304,
               timeout=12 * 3600, retries=3)
-def partition(n_cells: int = 16, k_part: int = 6, k: int = 16, method: str = "metis"):
+def partition(n_cells: int = 16, k_part: int = 6, k: int = 16, method: str = "metis",
+              variant: str = ""):
     """Cells for graph mode, as a standalone CPU job.
 
     GraphKNN drops every edge that crosses a cell boundary, so the partition
@@ -193,7 +251,9 @@ def partition(n_cells: int = 16, k_part: int = 6, k: int = 16, method: str = "me
                                             graph_partition_labels_metis)
 
     t0 = time.time()
-    neighbors = np.load(f"/vol/neighbors_k{k}.npy")
+    nb_file = f"/vol/neighbors{variant}_k{k}.npy"
+    neighbors = np.load(nb_file)
+    n_nodes = neighbors.shape[0]
     sub = np.ascontiguousarray(neighbors[:, :k_part])
     del neighbors
     print(f"partitioning on k={k_part} table, {int((sub >= 0).sum())} entries",
@@ -210,15 +270,15 @@ def partition(n_cells: int = 16, k_part: int = 6, k: int = 16, method: str = "me
     else:
         labels = graph_partition_labels(sub, n_cells)
 
-    name = f"labels_{used}_c{n_cells}.npy"
+    name = f"labels{variant}_{used}_c{n_cells}.npy"
     np.save(f"/vol/{name}", labels.astype(np.int64))
 
     # How much of the graph survives this partition, measured on the full table.
-    neighbors = np.load(f"/vol/neighbors_k{k}.npy", mmap_mode="r")
+    neighbors = np.load(nb_file, mmap_mode="r")
     kept = 0
     total = 0
     no_same_cell = 0
-    for i in range(0, N_NODES, 4_000_000):
+    for i in range(0, n_nodes, 4_000_000):
         nb = np.asarray(neighbors[i:i + 4_000_000])
         valid = nb >= 0
         own = np.broadcast_to(labels[i:i + nb.shape[0]][:, None], nb.shape)
@@ -236,7 +296,7 @@ def partition(n_cells: int = 16, k_part: int = 6, k: int = 16, method: str = "me
         "cell_sizes_min_max": [int(sizes.min()), int(sizes.max())],
         "edge_keep_frac": kept / max(total, 1),
         "nodes_with_no_same_cell_neighbor": no_same_cell,
-        "no_same_cell_frac": no_same_cell / N_NODES,
+        "no_same_cell_frac": no_same_cell / n_nodes,
         "seconds": round(time.time() - t0, 1),
     }
     print(stats, flush=True)
@@ -250,7 +310,8 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
             batch_size: int = 40000, n_noise: int = 2000, n_neighbors: int = 8,
             lr_scale: float = 0.015, late_exaggeration_time: float = 0.6,
             late_exaggeration_scale: float = 4.0,
-            cell_repulsion_weight: str = "auto"):
+            cell_repulsion_weight: str = "auto", variant: str = "",
+            cell_separation_weight: float = 0.0):
     import json
     import os
     import time
@@ -265,8 +326,9 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
     print(f"visible GPUs: {torch.cuda.device_count()}, torch {torch.__version__},"
           f" late_exaggeration_scale={late_exaggeration_scale}",
           flush=True)
-    neighbors = np.load(f"/vol/neighbors_k{k}.npy")
+    neighbors = np.load(f"/vol/neighbors{variant}_k{k}.npy")
     labels = np.load(f"/vol/{labels_file}")
+    n_nodes = neighbors.shape[0]
     print(f"neighbors {neighbors.shape} {neighbors.dtype}, labels {labels.shape}",
           flush=True)
 
@@ -284,6 +346,7 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
         late_exaggeration_scale=late_exaggeration_scale,
         cell_repulsion_weight=(cell_repulsion_weight if cell_repulsion_weight == "auto"
                                else float(cell_repulsion_weight)),
+        cell_separation_weight=cell_separation_weight,
     )
     elapsed = time.time() - t0
     coords = np.asarray(coords, dtype=np.float32)
@@ -292,16 +355,16 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
     # Neighbours must end up closer than random pairs or the layout ignored the
     # graph — every other sanity check passes on a layout that did.
     rng = np.random.default_rng(0)
-    idx = rng.choice(N_NODES, 200_000, replace=False)
+    idx = rng.choice(n_nodes, 200_000, replace=False)
     nb = neighbors[idx, 0]
     ok = nb >= 0
     d_nb = np.linalg.norm(coords[idx[ok]] - coords[nb[ok]], axis=1)
     d_rand = np.linalg.norm(
-        coords[idx[ok]] - coords[rng.integers(0, N_NODES, ok.sum())], axis=1)
+        coords[idx[ok]] - coords[rng.integers(0, n_nodes, ok.sum())], axis=1)
 
     # extent / occupied-bin fraction, the two structure measures the fork's
     # late-exaggeration table is reported in, so runs are comparable to it.
-    sub = coords[rng.choice(N_NODES, 5_000_000, replace=False)]
+    sub = coords[rng.choice(n_nodes, min(5_000_000, n_nodes), replace=False)]
     lo = np.percentile(sub, 0.1, axis=0)
     hi = np.percentile(sub, 99.9, axis=0)
     bins = 1000
@@ -322,6 +385,7 @@ def project(labels_file: str, tag: str, k: int = 16, epochs: int = 200,
         "occupied_bin_frac": occupied / (bins * bins),
         "late_exaggeration_scale": late_exaggeration_scale,
         "cell_repulsion_weight": cell_repulsion_weight,
+        "cell_separation_weight": cell_separation_weight,
     }
 
     # Do the cells occupy their own territory, or sit superimposed? This is the
@@ -423,7 +487,8 @@ def render(tag: str, width: int = 4000, height: int = 4000, pct: float = 0.02,
 @app.function(image=viz_image, volumes={"/vol": vol}, cpu=16, memory=131072,
               timeout=2 * 3600)
 def render_core(tag: str, width: int = 4000, frame_min_degree: int = 8,
-                min_degrees: str = "0,4,8", pct: float = 0.5):
+                min_degrees: str = "0,4,8", pct: float = 0.5,
+                variant: str = ""):
     """Renders framed on the connected core rather than on the whole point cloud.
 
     Framing by percentile over all 97.8M accounts is dominated by the low-degree
@@ -444,7 +509,7 @@ def render_core(tag: str, width: int = 4000, frame_min_degree: int = 8,
 
     t0 = time.time()
     coords = np.load(f"/vol/coords_{tag}.npy")
-    deg = np.load("/vol/degrees.npy")
+    deg = np.load(f"/vol/degrees{variant}.npy")
     good = np.isfinite(coords).all(axis=1)
     coords, deg = coords[good], deg[good]
 
@@ -646,19 +711,327 @@ def force_balance(tag: str, labels_file: str = "labels_metis_c16.npy",
     return res
 
 
+@app.function(image=viz_image, volumes={"/vol": vol}, cpu=16, memory=131072,
+              timeout=2 * 3600)
+def render_cells(tag: str, labels_file: str = "labels_metis_c16.npy",
+                 cells: str = "0,1", width: int = 4000, pct: float = 0.5,
+                 frame_min_degree: int = 8, min_degree: int = 0,
+                 variant: str = ""):
+    """Colour each cell separately to show how much the cells overlap.
+
+    Cells share no parameters and are coupled only by centroid repulsion, so
+    they can end up laid out on top of one another -- in which case distance
+    between two accounts in different cells means nothing. A categorical
+    render makes that directly visible: disjoint territories would read as
+    solid blocks of colour, superposition reads as an even blend everywhere.
+    """
+    import colorcet
+    import datashader as ds
+    import datashader.transfer_functions as tf
+    import numpy as np
+    import pandas as pd
+
+    coords = np.load(f"/vol/coords_{tag}.npy")
+    labels = np.load(f"/vol/{labels_file}")
+    deg = np.load(f"/vol/degrees{variant}.npy")
+    good = np.isfinite(coords).all(axis=1)
+    coords, labels, deg = coords[good], labels[good], deg[good]
+
+    core = coords[deg >= frame_min_degree] if (deg >= frame_min_degree).any() else coords
+    x_range = tuple(np.percentile(core[:, 0], [pct, 100 - pct]))
+    y_range = tuple(np.percentile(core[:, 1], [pct, 100 - pct]))
+
+    want = [int(c) for c in cells.split(",")]
+    sel = np.isin(labels, want)
+    if min_degree > 0:
+        sel &= deg >= min_degree
+    xy, lab = coords[sel], labels[sel]
+    print(f"{len(xy)} accounts across cells {want} (min_degree={min_degree})",
+          flush=True)
+
+    df = pd.DataFrame({"x": xy[:, 0], "y": xy[:, 1]})
+    df["cell"] = pd.Categorical([str(c) for c in lab],
+                                categories=[str(c) for c in want])
+
+    cvs = ds.Canvas(plot_width=width, plot_height=width,
+                    x_range=x_range, y_range=y_range)
+    agg = cvs.points(df, "x", "y", ds.count_cat("cell"))
+
+    palette = (["#00e5ff", "#ff2d95", "#ffe600", "#00ff6a"] if len(want) <= 4
+               else list(colorcet.glasbey_dark[:len(want)]))
+    color_key = {str(c): palette[i % len(palette)] for i, c in enumerate(want)}
+    img = tf.set_background(tf.shade(agg, color_key=color_key, how="eq_hist"), "black")
+    path = f"/vol/cells_{tag}_{'-'.join(map(str, want))}_{width}.png"
+    img.to_pil().save(path)
+
+    # How mixed are they? Per occupied bin, how often is more than one cell present.
+    counts = agg.data  # (H, W, n_cells)
+    present = counts > 0
+    n_present = present.sum(axis=2)
+    occupied = n_present > 0
+    stats = {
+        "cells": want,
+        "min_degree": min_degree,
+        "accounts": int(len(xy)),
+        "occupied_bins": int(occupied.sum()),
+        "bins_with_all_cells": int((n_present == len(want)).sum()),
+        "frac_occupied_bins_with_all_cells": float(
+            (n_present == len(want)).sum() / max(occupied.sum(), 1)),
+        "mean_cells_per_occupied_bin": float(n_present[occupied].mean()),
+    }
+    if len(want) == 2:
+        a, b = counts[:, :, 0].astype(np.float64), counts[:, :, 1].astype(np.float64)
+        both = (a > 0) & (b > 0)
+        stats["jaccard_occupied"] = float(
+            both.sum() / max(((a > 0) | (b > 0)).sum(), 1))
+        # per-bin share of cell 0; 0.5 everywhere == perfectly superimposed
+        share = np.where(both, a / np.maximum(a + b, 1), np.nan)
+        stats["median_bin_share_cell0"] = float(np.nanmedian(share))
+        stats["iqr_bin_share_cell0"] = [
+            float(np.nanpercentile(share, 25)), float(np.nanpercentile(share, 75))]
+    print(stats, flush=True)
+    vol.commit()
+    with open(path, "rb") as f:
+        return {"img": f.read(), "stats": stats}
+
+
+stlm_vol = modal.Volume.from_name("stlm-1")
+
+
+@app.function(image=viz_image, volumes={"/vol": vol, "/stlm": stlm_vol},
+              cpu=16, memory=131072, timeout=2 * 3600)
+def render_community_archive(tag: str, variant: str = "_deg8", width: int = 4000,
+                             frame_min_degree: int = 8, pct: float = 0.5,
+                             min_degree: int = 0, spread_px: int = 9):
+    """Highlight Community Archive members against the rest of the layout.
+
+    labels_community_archive.csv carries compact ids for the OLD graph bundle,
+    which are meaningless here -- compact ids are assigned per graph. The join
+    has to go through the raw X uid: csv account_id -> nodes.npz uids (this
+    graph's compact id) -> keep_deg8 (subgraph row), each by searchsorted on a
+    sorted uid array.
+    """
+    import csv
+    import time
+
+    import colorcet
+    import datashader as ds
+    import datashader.transfer_functions as tf
+    import numpy as np
+    import pandas as pd
+
+    t0 = time.time()
+    ca_uids, ca_names = [], []
+    with open("/stlm/labels_community_archive.csv") as f:
+        for row in csv.DictReader(f):
+            ca_uids.append(int(row["account_id"]))
+            ca_names.append(row["username"])
+    ca_uids = np.array(ca_uids, dtype=np.uint64)
+    print(f"{len(ca_uids)} community-archive accounts in the csv", flush=True)
+
+    uids = np.load("/vol/raw/nodes.npz")["uids"]
+    pos = np.searchsorted(uids, ca_uids)
+    inb = pos < len(uids)
+    pos_in = pos[inb]
+    hit = uids[pos_in] == ca_uids[inb]
+    full_ids = pos_in[hit]
+    print(f"{len(full_ids)} of them are in this graph", flush=True)
+
+    if variant:
+        keep = np.load(f"/vol/keep{variant}.npy").astype(np.int64)
+        p2 = np.searchsorted(keep, full_ids)
+        inb2 = p2 < len(keep)
+        p2_in = p2[inb2]
+        hit2 = keep[p2_in] == full_ids[inb2]
+        rows = p2_in[hit2]
+        print(f"{len(rows)} survive the {variant} degree cut", flush=True)
+    else:
+        rows = full_ids
+
+    coords = np.load(f"/vol/coords_{tag}.npy")
+    deg = np.load(f"/vol/degrees{variant}.npy")
+    good = np.isfinite(coords).all(axis=1)
+    keep_rows = np.zeros(len(coords), dtype=bool)
+    keep_rows[rows] = True
+    coords, deg, keep_rows = coords[good], deg[good], keep_rows[good]
+
+    core = coords[deg >= frame_min_degree]
+    x_range = tuple(np.percentile(core[:, 0], [pct, 100 - pct]))
+    y_range = tuple(np.percentile(core[:, 1], [pct, 100 - pct]))
+
+    sel = deg >= min_degree if min_degree > 0 else np.ones(len(coords), bool)
+    cvs = ds.Canvas(plot_width=width, plot_height=width,
+                    x_range=x_range, y_range=y_range)
+
+    base = cvs.points(pd.DataFrame({"x": coords[sel, 0], "y": coords[sel, 1]}),
+                      "x", "y")
+    ca = coords[keep_rows & sel]
+    hi = cvs.points(pd.DataFrame({"x": ca[:, 0], "y": ca[:, 1]}), "x", "y")
+
+    base_img = tf.shade(base, cmap=["#141414", "#6b3f1c", "#b87a33"], how="eq_hist")
+    # Only a few hundred archive members against 30M points: without a wide
+    # spread and a flat colour ramp they are a scatter of single pixels.
+    hi_img = tf.shade(tf.spread(hi, px=spread_px, shape="circle"),
+                      cmap=["#00e5ff", "#00e5ff", "#ffffff"], how="linear")
+    img = tf.set_background(tf.stack(base_img, hi_img, how="over"), "black")
+    path = f"/vol/ca_{tag}_md{min_degree}_{width}.png"
+    img.to_pil().save(path)
+
+    # Are archive members co-located, or scattered? Single-linkage over the
+    # few hundred of them, with the threshold set from the layout's own scale.
+    pts = coords[keep_rows]
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    np.fill_diagonal(d, np.inf)
+    nn = d.min(axis=1)
+    rand = coords[np.random.default_rng(0).choice(len(coords), len(pts),
+                                                  replace=False)]
+    dr = np.linalg.norm(rand[:, None, :] - rand[None, :, :], axis=-1)
+    np.fill_diagonal(dr, np.inf)
+    nn_rand = dr.min(axis=1)
+
+    thresh = float(np.median(nn_rand) / 10)
+    parent = list(range(len(pts)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    ii, jj = np.where(d < thresh)
+    for a, b in zip(ii.tolist(), jj.tolist()):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    sizes = np.bincount([find(i) for i in range(len(pts))])
+    sizes = sizes[sizes > 0]
+
+    stats = {
+        "csv_accounts": int(len(ca_uids)),
+        "in_graph": int(len(full_ids)),
+        "in_layout": int(keep_rows.sum()),
+        "drawn": int((keep_rows & sel).sum()),
+        "median_nn_dist": round(float(np.median(nn)), 3),
+        "median_nn_dist_random_accounts": round(float(np.median(nn_rand)), 3),
+        "link_threshold": round(thresh, 3),
+        "largest_cluster": int(sizes.max()),
+        "clusters_ge_2": int((sizes >= 2).sum()),
+        "singletons": int((sizes == 1).sum()),
+        "seconds": round(time.time() - t0, 1),
+    }
+    print(stats, flush=True)
+    vol.commit()
+    with open(path, "rb") as f:
+        return {"img": f.read(), "stats": stats}
+
+
+@app.function(image=viz_image, volumes={"/vol": vol, "/stlm": stlm_vol},
+              cpu=16, memory=131072, timeout=3600)
+def ca_membership(tag: str, variant: str = "_deg8"):
+    """Which Community Archive members share the main cluster, and which don't.
+
+    Same uid join as render_community_archive (csv account_id -> nodes.npz ->
+    subgraph row), then single-linkage at a tenth of the median nearest-neighbour
+    distance of an equal-sized random sample, so the threshold comes from the
+    layout's own scale rather than a magic number.
+    """
+    import csv
+
+    import numpy as np
+
+    ca_uids, ca_names = [], []
+    with open("/stlm/labels_community_archive.csv") as f:
+        for row in csv.DictReader(f):
+            ca_uids.append(int(row["account_id"]))
+            ca_names.append(row["username"])
+    ca_uids = np.array(ca_uids, dtype=np.uint64)
+    ca_names = np.array(ca_names, dtype=object)
+
+    uids = np.load("/vol/raw/nodes.npz")["uids"]
+    pos = np.searchsorted(uids, ca_uids)
+    inb = pos < len(uids)
+    hit = uids[pos[inb]] == ca_uids[inb]
+    full_ids = pos[inb][hit]
+    names = ca_names[inb][hit]
+
+    if variant:
+        keep = np.load(f"/vol/keep{variant}.npy").astype(np.int64)
+        p2 = np.searchsorted(keep, full_ids)
+        inb2 = p2 < len(keep)
+        hit2 = keep[p2[inb2]] == full_ids[inb2]
+        rows = p2[inb2][hit2]
+        names = names[inb2][hit2]
+    else:
+        rows = full_ids
+
+    coords = np.load(f"/vol/coords_{tag}.npy")
+    ok = np.isfinite(coords[rows]).all(axis=1)
+    rows, names = rows[ok], names[ok]
+    pts = coords[rows]
+
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    np.fill_diagonal(d, np.inf)
+    rnd = coords[np.random.default_rng(0).choice(len(coords), len(pts), replace=False)]
+    dr = np.linalg.norm(rnd[:, None, :] - rnd[None, :, :], axis=-1)
+    np.fill_diagonal(dr, np.inf)
+    thresh = float(np.median(dr.min(axis=1)) / 10)
+
+    parent = list(range(len(pts)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    ii, jj = np.where(d < thresh)
+    for a, b in zip(ii.tolist(), jj.tolist()):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    root = np.array([find(i) for i in range(len(pts))])
+    sizes = {r: int((root == r).sum()) for r in set(root.tolist())}
+    main = max(sizes, key=lambda r: sizes[r])
+
+    in_main = sorted(names[root == main].tolist(), key=str.lower)
+    singles = sorted(names[[sizes[r] == 1 for r in root]].tolist(), key=str.lower)
+    small = {}
+    for r, sz in sizes.items():
+        if r != main and sz > 1:
+            small[str(sz)] = small.get(str(sz), []) + [
+                sorted(names[root == r].tolist(), key=str.lower)]
+
+    out = {
+        "threshold": round(thresh, 4),
+        "total": int(len(pts)),
+        "main_cluster_size": len(in_main),
+        "main_cluster": in_main,
+        "singletons_count": len(singles),
+        "singletons": singles,
+        "small_clusters": small,
+    }
+    print(f"main={len(in_main)} singletons={len(singles)} "
+          f"small_clusters={sum(len(v) for v in small.values())}", flush=True)
+    return out
+
+
 @app.local_entrypoint()
 def main(stage: str = "all", tag: str = "c16metis", labels_file: str = "",
          epochs: int = 200, n_cells: int = 16, lr_scale: float = 0.015,
          late_exaggeration_scale: float = 4.0,
-         cell_repulsion_weight: str = "auto"):
+         cell_repulsion_weight: str = "auto", cells: str = "0,1",
+         frame_min_degree: int = 8, min_degree: int = 0, variant: str = "",
+         cell_separation_weight: float = 0.0):
     import os
 
     if stage in ("all", "fetch"):
         print("fetch:", fetch.remote())
     if stage in ("all", "build"):
         print("build_neighbors:", build_neighbors.remote())
+    if stage == "subgraph":
+        print("build_subgraph:", build_subgraph.remote(min_degree=min_degree or 8))
     if stage in ("all", "partition"):
-        st = partition.remote(n_cells=n_cells)
+        st = partition.remote(n_cells=n_cells, variant=variant)
         print("partition:", st)
         labels_file = st["labels_file"]
     if stage in ("all", "project"):
@@ -666,7 +1039,38 @@ def main(stage: str = "all", tag: str = "c16metis", labels_file: str = "",
         print("project:", project.remote(
             labels_file=labels_file, tag=tag, epochs=epochs, lr_scale=lr_scale,
             late_exaggeration_scale=late_exaggeration_scale,
-            cell_repulsion_weight=cell_repulsion_weight))
+            cell_repulsion_weight=cell_repulsion_weight, variant=variant,
+            cell_separation_weight=cell_separation_weight))
+    if stage == "camembers":
+        import json
+        r = ca_membership.remote(tag=tag, variant=variant)
+        os.makedirs("out", exist_ok=True)
+        with open("out/community_archive_clusters.json", "w") as f:
+            json.dump(r, f, indent=1)
+        print(json.dumps({k: v for k, v in r.items()
+                          if k not in ("main_cluster", "singletons")}, indent=1))
+        print("wrote out/community_archive_clusters.json")
+    if stage == "ca":
+        r = render_community_archive.remote(tag=tag, variant=variant,
+                                            min_degree=min_degree)
+        os.makedirs("out", exist_ok=True)
+        pth = f"out/xyra90m_{tag}_communityarchive.png"
+        with open(pth, "wb") as f:
+            f.write(r["img"])
+        print("stats:", r["stats"])
+        print(f"wrote {pth} ({len(r['img']) / 1e6:.1f} MB)")
+    if stage == "cells":
+        r = render_cells.remote(tag=tag, cells=cells,
+                                frame_min_degree=frame_min_degree,
+                                min_degree=min_degree, variant=variant,
+                                labels_file=labels_file or "labels_metis_c16.npy")
+        os.makedirs("out", exist_ok=True)
+        pth = (f"out/xyra90m_{tag}_cells_{cells.replace(',', '-')}"
+               f"_fmd{frame_min_degree}_md{min_degree}.png")
+        with open(pth, "wb") as f:
+            f.write(r["img"])
+        print("stats:", r["stats"])
+        print(f"wrote {pth} ({len(r['img']) / 1e6:.1f} MB)")
     if stage == "force":
         print("force_balance:", force_balance.remote(tag=tag))
     if stage == "overlap":
@@ -674,7 +1078,7 @@ def main(stage: str = "all", tag: str = "c16metis", labels_file: str = "",
     if stage == "voids":
         print("centroid_voids:", centroid_voids.remote(tag=tag)["median_ratio"])
     if stage == "core":
-        blobs = render_core.remote(tag=tag)
+        blobs = render_core.remote(tag=tag, variant=variant)
         os.makedirs("out", exist_ok=True)
         for name, data in blobs.items():
             p = f"out/xyra90m_{tag}_core_{name}.png"

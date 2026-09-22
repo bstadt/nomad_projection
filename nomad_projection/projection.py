@@ -95,7 +95,9 @@ class NomadProjection:
               context,
               cell_of_row=None,
               mu_cell_ids=None,
-              cell_repulsion_weight=1.0):
+              cell_repulsion_weight=1.0,
+              local_cell_ids=None,
+              cell_separation_weight=0.0):
 
             x = torch.cat([self._model[model_num] for model_num in model_idxs], axis=0)
             mus = torch.stack([self._model[model_num].mean(dim=0) for model_num in model_idxs], axis=0)
@@ -113,7 +115,6 @@ class NomadProjection:
                 # n_cells=16 on 8 GPUs). Rows are rank-major; mu_cell_ids carries
                 # the matching global cell id so a point can mask its own.
                 all_mus = torch.cat(mu_container, dim=0)
-                del mus
             else:
                 all_mus = mus
 
@@ -162,6 +163,26 @@ class NomadProjection:
                 losses = -1 * pos_weight * (torch.log(poskerns) * pji).sum(axis=-1) + neg_weight * (torch.log(poskerns + negkerns + dist_negkerns) * pji).sum(axis=-1)
 
                 loss = losses.mean()
+
+                # Centroid-to-centroid separation, at layout scale.
+                #
+                # dist_negkerns repels every POINT from centroids that all sit
+                # near the origin, which is an isotropic push that cannot
+                # separate anything, and with 1/(1+d^2) its force decays as
+                # 1/d^3 -- negligible once the layout is wider than a few units.
+                # Here the repulsion acts between the centroids themselves, and
+                # mu_i is the differentiable mean of cell i's points, so the
+                # gradient translates the whole cell as a body and leaves its
+                # internal structure alone. Distances are measured in units of
+                # the current layout radius, so the force stays meaningful as
+                # the embedding grows instead of vanishing.
+                if cell_separation_weight > 0 and local_cell_ids is not None:
+                    sigma = x.detach().pow(2).sum(dim=1).mean().sqrt().clamp(min=1e-6)
+                    dmu2 = ((mus[:, None, :] - all_mus[None, :, :].detach()) ** 2).sum(-1)
+                    kmu = 1.0 / (1.0 + dmu2 / (sigma ** 2))
+                    kmu = kmu.masked_fill(
+                        local_cell_ids.unsqueeze(1) == mu_cell_ids.unsqueeze(0), 0.0)
+                    loss = loss + cell_separation_weight * kmu.sum(dim=1).mean()
                 
             loss.backward()
 
@@ -181,7 +202,8 @@ class NomadProjection:
                      lr_scale,
                      learning_rate_decay_start_time,
                      distributed,
-                     cell_repulsion_weight='auto'):
+                     cell_repulsion_weight='auto',
+                     cell_separation_weight=0.0):
 
         # derive schedules
         def n_noise_schedule(t):
@@ -231,6 +253,8 @@ class NomadProjection:
         n_cells_total = len(self._model)
         # Global cell id for each row of torch.cat(mu_container): rank-major,
         # matching how all_gather lays out the per-rank centroid blocks.
+        local_cell_ids = torch.tensor(model_idxs, dtype=torch.long,
+                                      device=f'cuda:{rank}')
         mu_cell_ids = torch.tensor(
             [c for i in range(self.world_size) for c in range(n_cells_total)
              if self.gpu_cluster_map[c] == i] if distributed else list(model_idxs),
@@ -271,7 +295,9 @@ class NomadProjection:
                                   context=context,
                                   cell_of_row=cell_of_row,
                                   mu_cell_ids=mu_cell_ids,
-                                  cell_repulsion_weight=cur_cell_w)
+                                  cell_repulsion_weight=cur_cell_w,
+                                  local_cell_ids=local_cell_ids,
+                                  cell_separation_weight=cell_separation_weight)
 
                 epoch_loss_sum += loss
                 epoch_steps += 1
@@ -319,7 +345,8 @@ class NomadProjection:
             learning_rate_decay_start_time=0.3,
             lr_scale=0.1,
             cluster_subset_size=5000000,
-            cell_repulsion_weight='auto',
+            cell_repulsion_weight=1.0,
+            cell_separation_weight=0.0,
             debug_plot=False,
            ):
         """Project to 2D.
@@ -335,6 +362,15 @@ class NomadProjection:
           given, otherwise from `graph_partition`. X, when present alongside
           neighbors, is used only for partitioning and PCA init.
 
+        cell_separation_weight adds a repulsion between the cell CENTROIDS,
+        measured in units of the current layout radius. cell_repulsion_weight
+        cannot separate cells at any magnitude: it pushes every point away from
+        centroids that all sit near the origin, which is an isotropic force, and
+        1/(1+d^2) decays as 1/d^3 so it is ~1e-6 once the layout is wide. This
+        term instead acts centroid-to-centroid; since mu_i is the differentiable
+        mean of cell i's points, its gradient translates the cell as a body and
+        leaves the within-cell layout intact. 0 disables it.
+
         cell_repulsion_weight scales the repulsion of every point from the
         other cells' centroids. Cells are otherwise coupled by nothing else, so
         this is the only force that can keep them from being laid out on top of
@@ -343,8 +379,24 @@ class NomadProjection:
         1/(1+d^2) it only bites within ~1 unit -- measured on a 97.8M-node
         graph it carved a hole at each centroid while the 16 cells stayed fully
         superimposed (median centroid separation 15 against within-cell spread
-        119). 'auto' (default) uses n_noise/(n_cells-1), putting one centroid on
-        the same footing as one random negative; pass 1.0 for the old behaviour.
+        119).
+
+        Raising it does NOT fix that, and measurably makes it worse. Every
+        centroid already sits near the origin, so "repel from the other cells'
+        centroids" is, for every point of every cell, the same isotropic
+        outward push; it drives each cell toward a symmetric annulus, whose
+        centroid is the origin. Measured at n_cells=16, 97.8M nodes, 150
+        epochs, separation ratio = median centroid distance / median within-cell
+        spread:
+
+            weight   1     10    n_noise/(n_cells-1)=133
+            sep      0.105 0.104 0.074
+            centroid 7.36  7.21  5.16   (spread flat at ~70)
+
+        so the knob is kept for measurement but defaults to 1.0. Separating the
+        cells needs the symmetry broken before training -- initialising each
+        cell around its own position in a coarse layout of the cell graph --
+        not a bigger coefficient on a centrally-symmetric force.
 
         cell_labels, when given, overrides both partitioners with a
         precomputed (n,) cell assignment and sets n_cells from it. Partitioning
@@ -471,7 +523,8 @@ class NomadProjection:
                         lr_scale,
                         learning_rate_decay_start_time,
                         distributed,
-                        cell_repulsion_weight),
+                        cell_repulsion_weight,
+                        cell_separation_weight),
                     join=True)
         else:
             self.train_on_gpu(rank=0,
@@ -486,7 +539,8 @@ class NomadProjection:
                               lr_scale=lr_scale,
                               learning_rate_decay_start_time=learning_rate_decay_start_time,
                               distributed=distributed,
-                              cell_repulsion_weight=cell_repulsion_weight)
+                              cell_repulsion_weight=cell_repulsion_weight,
+                              cell_separation_weight=cell_separation_weight)
 
         # Collect final embeddings in the order of input data
         final_embeddings = torch.zeros((len(self.cluster_assignments), 2), dtype=torch.float32)
